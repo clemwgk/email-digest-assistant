@@ -24,16 +24,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Inspect token.json
-        run: |
-          head -20 token.json
-          cat -A token.json
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - run: |
           printf '%s' "${{ secrets.GMAIL_CREDENTIALS_JSON }}" > credentials.json
           printf '%s' "${{ secrets.GMAIL_TOKEN_JSON }}" > token.json
+      - name: Inspect token.json
+        run: |
+          head -20 token.json
+          cat -A token.json
       - run: |
           printf "OPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
             "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
