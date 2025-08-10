@@ -28,8 +28,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - run: |
-          echo "${{ secrets.GMAIL_CREDENTIALS_JSON }}" > credentials.json
-          echo "${{ secrets.GMAIL_TOKEN_JSON }}" > token.json
+          printf '%s' "${{ secrets.GMAIL_CREDENTIALS_JSON }}" > credentials.json
+          printf '%s' "${{ secrets.GMAIL_TOKEN_JSON }}" > token.json
       - run: |
           printf "OPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
             "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
