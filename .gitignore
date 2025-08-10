@@ -1,0 +1,14 @@
+# Sensitive/local configuration files (user-specified)
+.env
+token.json
+credentials.json
+senders_seen.txt
+
+# Python cache (auto-generated; safe to ignore)
+__pycache__/
+
+# Recommended by AI assistant for cleanliness — avoids clutter and phantom changes
+*.pyc          # Compiled Python files, recreated automatically
+.vscode/       # VS Code workspace settings (personal)
+.idea/         # JetBrains IDE settings (personal)
+.DS_Store      # macOS folder view settings (irrelevant to code)
