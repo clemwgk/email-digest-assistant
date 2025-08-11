@@ -5,7 +5,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
-import openai
+from openai import OpenAI
 
 # Kill switch
 if os.getenv("DISABLE_DIGEST", "").strip() == "1":
@@ -55,16 +55,18 @@ def get_message_details(service, msg_id, user_id="me"):
     return sender, subject, snippet
 
 def summarize_email(content):
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model="gpt-3.5-turbo",  # you can switch to "gpt-4o-mini" later if you prefer
         messages=[
             {"role": "system", "content": "Summarize this email"},
             {"role": "user", "content": content}
         ],
-        max_tokens=100
+        max_tokens=100,
+        temperature=0.2
     )
-    return resp.choices[0].message["content"].strip()
+    return resp.choices[0].message.content.strip()
+
 
 def main():
     service = authenticate()
