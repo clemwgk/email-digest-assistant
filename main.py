@@ -21,6 +21,10 @@ def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+# --- OpenAI client (create once) ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+OPENAI_MODEL = "gpt-4.1-mini"
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 def authenticate():
@@ -55,9 +59,8 @@ def get_message_details(service, msg_id, user_id="me"):
     return sender, subject, snippet
 
 def summarize_email(content):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     resp = client.chat.completions.create(
-        model="gpt-3.5-turbo",  # you can switch to "gpt-4o-mini" later if you prefer
+        model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": "Summarize this email"},
             {"role": "user", "content": content}
@@ -66,7 +69,6 @@ def summarize_email(content):
         temperature=0.2
     )
     return resp.choices[0].message.content.strip()
-
 
 def main():
     service = authenticate()
