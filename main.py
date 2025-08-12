@@ -9,6 +9,9 @@ from openai import OpenAI
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import time
+from openai import APIError, RateLimitError, APIConnectionError, APITimeoutError
+
 
 # Kill switch
 if os.getenv("DISABLE_DIGEST", "").strip() == "1":
@@ -27,6 +30,9 @@ def debug_print(*args, **kwargs):
 # --- OpenAI client (create once) ---
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 OPENAI_MODEL = "gpt-4.1-mini"
+MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-3.5-turbo"]
+MAX_RETRIES = 2
+BASE_BACKOFF = 2.0  # seconds
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
@@ -62,16 +68,36 @@ def get_message_details(service, msg_id, user_id="me"):
     return sender, subject, snippet
 
 def summarize_email(content):
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "Summarize this email"},
-            {"role": "user", "content": content}
-        ],
-        max_tokens=100,
-        temperature=0.2
-    )
-    return resp.choices[0].message.content.strip()
+    last_err = None
+    for model in MODEL_CANDIDATES:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "Summarize this email"},
+                        {"role": "user", "content": content}
+                    ],
+                    max_tokens=100,
+                    temperature=0.2
+                )
+                if DEBUG:
+                    print(f"[summarize] model={model} attempt={attempt} OK")
+                return resp.choices[0].message.content.strip()
+            except (RateLimitError, APIError, APIConnectionError, APITimeoutError) as e:
+                last_err = e
+                if DEBUG:
+                    print(f"[summarize] model={model} attempt={attempt} error: {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(BASE_BACKOFF * attempt)  # 2s, then 4s
+                else:
+                    break  # try next model
+            except Exception as e:
+                last_err = e
+                if DEBUG:
+                    print(f"[summarize] model={model} non-retryable error: {e}")
+                break
+    raise RuntimeError(f"All model attempts failed. Last error: {last_err}")
 
 def send_digest_email(subject, body_text):
     sender = os.getenv("EMAIL_USERNAME")
