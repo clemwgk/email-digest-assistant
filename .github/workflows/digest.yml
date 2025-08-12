@@ -2,8 +2,7 @@ name: Email Digest (Daily)
 
 on:
   schedule:
-    # 09:00 AM Asia/Singapore (UTC+8) = 01:00 UTC
-    - cron: "0 1 * * *"
+    - cron: "17 1 * * *"   # 09:17 Asia/Singapore (UTC+8)
   workflow_dispatch: {}
 
 concurrency:
