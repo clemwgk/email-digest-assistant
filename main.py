@@ -38,6 +38,8 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Model fallback + retries
 MODEL_CANDIDATES = [
+    "gpt-5-mini",
+    "gpt-5-nano",
     "gpt-4.1-mini",
     "gpt-4o-mini",
     "gpt-3.5-turbo",
@@ -46,10 +48,10 @@ MAX_RETRIES = 2
 BASE_BACKOFF = 2.0  # seconds
 
 # Tunables
-MAX_SINGLE_PASS = 60                              # single-pass if pool <= this; else rare fallback
-SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "300"))  # ↑ from 220 → 300
+MAX_SINGLE_PASS = 60                               # single-pass if pool <= this; else rare fallback
+SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "350")) # optimized snippets (action/date/amount)
 TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))  # SGD threshold for txn alerts
-DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action required", "iras", "mom", "hdb", "bank"]
+DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action required"]
 
 # Gmail scope
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -124,23 +126,19 @@ TAG_RE = re.compile(r"<[^>]+>")
 def _clean_html_to_text(html_str: str) -> str:
     return TAG_RE.sub("", html.unescape(html_str))
 
-def _extract_body_snippet(msg_data, max_len: int) -> str:
-    """
-    Extract a text snippet from Gmail message payload:
-    - Try top-level body
-    - Walk nested parts, prefer text/plain then text/html (stripped)
-    """
+def _extract_full_body_text(msg_data) -> str:
+    """Extract all text from message parts, preferring text/plain but also stripping HTML."""
     try:
         payload = msg_data.get("payload", {})
-
-        # 1) Direct body (top-level)
+        # 1) Direct body
         body_data = payload.get("body", {}).get("data")
         if body_data:
             text = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="ignore")
-            return text[:max_len].strip().replace("\n", " ")
+            return text.strip()
 
-        # 2) Walk nested parts (stack DFS)
+        # 2) Walk parts (DFS)
         stack = [payload]
+        full_texts = []
         while stack:
             part = stack.pop()
             if not isinstance(part, dict):
@@ -150,17 +148,35 @@ def _extract_body_snippet(msg_data, max_len: int) -> str:
             parts = part.get("parts", [])
             if parts:
                 stack.extend(parts)
-
             if part_body and mime == "text/plain":
                 text = base64.urlsafe_b64decode(part_body).decode("utf-8", errors="ignore")
-                return text[:max_len].strip().replace("\n", " ")
-            if part_body and mime == "text/html":
+                full_texts.append(text.strip())
+            elif part_body and mime == "text/html":
                 html_txt = base64.urlsafe_b64decode(part_body).decode("utf-8", errors="ignore")
-                text = _clean_html_to_text(html_txt)
-                return text[:max_len].strip().replace("\n", " ")
+                full_texts.append(_clean_html_to_text(html_txt).strip())
+        return "\n".join(full_texts)
     except Exception:
-        pass
-    return "[Could not extract body]"
+        return ""
+
+def _extract_smart_snippet(msg_data, max_len: int) -> str:
+    """Pull key sentences (action words, dates, amounts); else first part of body."""
+    full_text = _extract_full_body_text(msg_data)
+    if not full_text:
+        return "[Could not extract body]"
+
+    important_patterns = [
+        r'[^.!?]*\b(due|deadline|expire|action required|respond|pay|submit|urgent)\b[^.!?]*[.!?]',
+        r'[^.!?]*\$\s?[\d,]+(?:\.\d{2})?[^.!?]*[.!?]',                                  # Money with $
+        r'[^.!?]*\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b[^.!?]*[.!?]',                         # Dates like 12/08/2025
+        r'[^.!?]*\b(invoice|bill|payment|receipt)\b[^.!?]*[.!?]',
+    ]
+    key_sentences = []
+    for pattern in important_patterns:
+        key_sentences.extend(re.findall(pattern, full_text, flags=re.IGNORECASE))
+
+    result = ' '.join(key_sentences[:4]).strip() or full_text
+    result = re.sub(r'\s+', ' ', result.replace('\n', ' ').replace('\r', ' '))
+    return result[:max_len].strip()
 
 # =========================================================
 # Watermark = last sent digest time
@@ -184,22 +200,39 @@ def get_last_run_timestamp(service) -> int:
         return fallback
 
 # =========================================================
-# Transaction amount parsing (for bank alerts)
+# Transaction detection (precise)
 # =========================================================
 AMOUNT_RE = re.compile(r'(?i)\b(?:SGD|S\$|\$|USD|US\$|AUD|EUR|GBP)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:[.,][0-9]{2})|[0-9]+(?:[.,][0-9]{2})?)')
 
-def parse_txn_amount(subject: str, snippet: str):
+def enhanced_txn_detection(subject: str, snippet: str):
     """
     Returns (is_txn_alert: bool, currency: str|None, amount: float|None).
-    Lightweight parser for subjects/snippets like:
-    'UOB - Transaction Alert (SGD 43.70 at STARHUB EPAYMENT)'
+    Distinguishes real transactions vs statements/advice.
     """
-    text = f"{subject} {snippet}"
-    if "transaction alert" not in text.lower():
+    text = f"{subject} {snippet}".lower()
+
+    # Negative indicators (exclude statements/advice)
+    statement_indicators = [
+        'statement', 'estatement', 'advice ready', 'available for viewing',
+        'monthly statement', 'account summary', 'balance summary'
+    ]
+    if any(ind in text for ind in statement_indicators):
         return (False, None, None)
+
+    # Positive indicators for actual transactions
+    transaction_indicators = [
+        'transaction alert', 'charged', 'spent', 'card ending', 'purchase',
+        'debit', 'withdrawal', 'pos', 'merchant', 'payment made', 'transfer',
+        'declined', 'failed', 'authorized', 'unauthorized'
+    ]
+    is_transaction = any(ind in text for ind in transaction_indicators)
+    if not is_transaction:
+        return (False, None, None)
+
     m = AMOUNT_RE.search(text)
     if not m:
         return (True, None, None)
+
     raw = m.group(0).strip()
     cur = "SGD" if re.search(r'(?i)sgd|s\$', raw) else ("USD" if re.search(r'(?i)usd|us\$', raw) else None)
     num = re.sub(r'[^0-9.,]', '', raw).replace(',', '')
@@ -238,7 +271,7 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'N/A')
             ts = int(msg.get('internalDate', '0')) // 1000
             thread_id = msg.get('threadId')
-            snippet = _extract_body_snippet(msg, max_len=snippet_len)
+            snippet = _extract_smart_snippet(msg, max_len=snippet_len)
 
             combined = (subject + ' ' + snippet).lower()
             if any(k in combined for k in ['otp', 'verification code', '2fa', 'login code']):
@@ -251,7 +284,7 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
                 except Exception:
                     pass
 
-            is_txn, cur, amt = parse_txn_amount(subject, snippet)
+            is_txn, cur, amt = enhanced_txn_detection(subject, snippet)
 
             item = {
                 'id': m['id'],
@@ -282,7 +315,7 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
     return pool
 
 # =========================================================
-# GPT: fallback + JSON selection (no hallucinations)
+# GPT: fallback + enhanced JSON selection
 # =========================================================
 def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     """
@@ -312,10 +345,9 @@ def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     combined = "\n".join([f"[{model}] {err}" for model, err in errors])
     raise RuntimeError(f"All GPT model calls failed.\n{combined}")
 
-def build_selection_prompt_json(emails):
+def build_enhanced_selection_prompt_json(emails):
     """
-    JSON-only selection to prevent hallucinations.
-    Includes txn flags so the model can apply the amount threshold rule.
+    Enhanced JSON-only selection with better summarization and importance explanation.
     """
     K = min(5, len(emails))
     header = (
@@ -332,10 +364,14 @@ def build_selection_prompt_json(emails):
         "3) Bills/payment due always matter.\n"
         "4) Social media last; include only if nothing better exists.\n"
         "5) Avoid duplicates (same thread/topic).\n"
-        "6) **Bank card transaction alerts**: treat as lower priority **unless** any of the following:\n"
+        "6) **Bank/financial notifications**: treat as lower priority **unless** any of the following:\n"
         f"   - amount ≥ {TXN_ALERT_MIN} (assume SGD if currency missing)\n"
         "   - contains terms like: declined, failed, suspicious, unauthorized, dispute, fraud\n"
         "   - unusual merchant hints (use judgment)\n\n"
+        "For each selection, provide enhanced details:\n"
+        "- **why**: 2-3 sentences explaining (a) what the email is about, (b) why it matters, (c) what might need to be done\n"
+        "- **action**: specific action needed if any (e.g., 'Pay by Aug 20', 'Review and respond', 'No action needed')\n"
+        "- **urgency**: High/Medium/Low based on deadlines and consequences\n\n"
         "RULES (CRITICAL):\n"
         "- Select only from provided `id` values. DO NOT invent emails.\n"
         "- If EMAIL_COUNT < 5, return exactly EMAIL_COUNT items.\n"
@@ -344,7 +380,9 @@ def build_selection_prompt_json(emails):
         '  "picks": [\n'
         '    {"id": "<id>", "type": "Call to Action" | "For Information Only", '
         '     "category": "Legal" | "Government" | "Billing/Payment" | "Other", '
-        '     "why": "<1–2 concise lines>"}\n'
+        '     "why": "<2-3 sentences>", '
+        '     "action": "<specific action or No action needed>", '
+        '     "urgency": "High" | "Medium" | "Low"}\n'
         '  ]\n'
         '}\n\n'
         "EMAILS:\n"
@@ -363,10 +401,9 @@ def build_selection_prompt_json(emails):
         }, ensure_ascii=False))
     return header + "\n".join(lines)
 
-def parse_json_picks(raw: str, valid_ids: set, want_count: int):
+def parse_enhanced_json_picks(raw: str, valid_ids: set, want_count: int):
     """
-    Parse the model's JSON. Enforce: ids must be from valid_ids.
-    If parsing fails or fewer than needed, caller can add deterministic fallback.
+    Parse the enhanced model's JSON with action and urgency fields.
     """
     picks = []
     try:
@@ -377,22 +414,33 @@ def parse_json_picks(raw: str, valid_ids: set, want_count: int):
             _type = item.get("type")
             _cat = item.get("category")
             _why = item.get("why")
-            if _id in valid_ids and _type in ("Call to Action", "For Information Only") and \
-               _cat in ("Legal", "Government", "Billing/Payment", "Other") and isinstance(_why, str):
-                picks.append({"id": _id, "type": _type, "category": _cat, "why": _why.strip()})
+            _action = item.get("action")
+            _urgency = item.get("urgency")
+            if (_id in valid_ids and 
+                _type in ("Call to Action", "For Information Only") and 
+                _cat in ("Legal", "Government", "Billing/Payment", "Other") and 
+                isinstance(_why, str) and isinstance(_action, str) and 
+                _urgency in ("High", "Medium", "Low")):
+                picks.append({
+                    "id": _id, "type": _type, "category": _cat,
+                    "why": _why.strip(), "action": _action.strip(), "urgency": _urgency
+                })
             if len(picks) >= want_count:
                 break
     except Exception:
         picks = []
     return picks
 
+# =========================================================
+# Rendering
+# =========================================================
 def render_text_digest(picks, emails_by_id, model_used, considered_count, window_start, window_end):
     from datetime import datetime as _dt
     header = (
         f"# AI Email Digest ({_dt.now().strftime('%Y-%m-%d')})\n"
         f"_Model: {model_used}_\n"
         f"Considered: {considered_count} emails (from {window_start} to {window_end}).\n\n"
-        "# Today’s Top " + str(len(picks)) + " Emails\n"
+        "# Today's Top " + str(len(picks)) + " Emails\n"
     )
     lines = []
     for i, p in enumerate(picks, 1):
@@ -401,7 +449,9 @@ def render_text_digest(picks, emails_by_id, model_used, considered_count, window
             f"{i}. **{e['subject']}** — _{e['from_domain']}_\n"
             f"   - **Type:** {p['type']}\n"
             f"   - **Category:** {p['category']}\n"
+            f"   - **Urgency:** {p['urgency']}\n"
             f"   - **Why:** {p['why']}\n"
+            f"   - **Action:** {p['action']}\n"
             f"   - **Snippet:** {e['snippet']}\n"
         )
     return header + ("\n".join(lines) if lines else "_No eligible emails._")
@@ -410,21 +460,19 @@ def _badge(label: str, bg: str, color: str = "#111"):
     return f"<span style='display:inline-block;padding:2px 6px;border-radius:12px;background:{bg};color:{color};font-size:12px;font-weight:600'>{html.escape(label)}</span>"
 
 def render_html_digest(picks, emails_by_id, model_used, considered_count, window_start, window_end):
-    # Simple, Gmail-friendly inline-CSS layout
     items_html = []
     for i, p in enumerate(picks, 1):
         e = emails_by_id[p["id"]]
-        subj = html.escape(e["subject"])
-        dom = html.escape(e["from_domain"])
-        snip = html.escape(e["snippet"])
-        # badges
-        type_bg = "#fde68a" if p["type"] == "Call to Action" else "#dbeafe"  # amber vs blue
+        subj = html.escape(e["subject"]); dom = html.escape(e["from_domain"])
+        snip = html.escape(e["snippet"]); why = html.escape(p["why"]); action = html.escape(p["action"])
+        type_bg = "#fde68a" if p["type"] == "Call to Action" else "#dbeafe"
         cat_bg_map = {"Legal": "#fecaca", "Government": "#fde68a", "Billing/Payment": "#bbf7d0", "Other": "#e5e7eb"}
         cat_bg = cat_bg_map.get(p["category"], "#e5e7eb")
+        urgency_bg_map = {"High": "#fecaca", "Medium": "#fde68a", "Low": "#d1fae5"}
+        urgency_bg = urgency_bg_map.get(p["urgency"], "#e5e7eb")
         txn_chip = ""
         if e.get("txn_alert"):
-            amt = e.get("txn_amount")
-            cur = e.get("txn_currency") or "SGD"
+            amt = e.get("txn_amount"); cur = e.get("txn_currency") or "SGD"
             if amt is not None:
                 over = amt >= TXN_ALERT_MIN
                 txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#bbf7d0" if over else "#e5e7eb")
@@ -438,9 +486,12 @@ def render_html_digest(picks, emails_by_id, model_used, considered_count, window
               {_badge(p["type"], type_bg)}
               <span style="display:inline-block;width:6px"></span>
               {_badge(p["category"], cat_bg)}
+              <span style="display:inline-block;width:6px"></span>
+              {_badge(f"Urgency: {p['urgency']}", urgency_bg)}
               {'<span style="display:inline-block;width:6px"></span>' + txn_chip if txn_chip else ''}
             </div>
-            <div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> {html.escape(p['why'])}</div>
+            <div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> {why}</div>
+            <div style="font-size:13px;margin-bottom:6px"><strong>Action:</strong> {action}</div>
             <div style="font-size:12px;color:#6b7280"><strong>Snippet:</strong> {snip}</div>
           </div>
         """)
@@ -459,24 +510,28 @@ def render_html_digest(picks, emails_by_id, model_used, considered_count, window
     """
     return f"<html><body>{header_html}</body></html>"
 
-def select_top_k_via_json(pool, window_start, window_end):
-    """Single entry point for JSON-based selection with deterministic fallback."""
+# =========================================================
+# Selection wrapper
+# =========================================================
+def select_top_k_via_enhanced_json(pool, window_start, window_end):
+    """Enhanced JSON-based selection with deterministic fallback."""
     want = min(5, len(pool))
-    prompt = build_selection_prompt_json(pool)
+    prompt = build_enhanced_selection_prompt_json(pool)
     messages = [{"role": "user", "content": prompt}]
     raw, model_used = call_gpt_with_fallback(messages)
 
     valid_ids = {e["id"] for e in pool}
-    picks = parse_json_picks(raw, valid_ids, want)
+    picks = parse_enhanced_json_picks(raw, valid_ids, want)
 
-    # Deterministic fallback if model output is empty/invalid
     if len(picks) < want:
         missing = want - len(picks)
         chosen = {p["id"] for p in picks}
         fallback_items = [e for e in pool if e["id"] not in chosen][:missing]
-        picks += [{"id": e["id"], "type": "For Information Only", "category": "Other",
-                   "why": "Selected by fallback (newest) due to invalid/empty model output."}
-                  for e in fallback_items]
+        picks += [{
+            "id": e["id"], "type": "For Information Only", "category": "Other",
+            "why": "Selected by fallback (newest) due to invalid/empty model output. Please review manually.",
+            "action": "Review manually", "urgency": "Low"
+        } for e in fallback_items]
     return picks, model_used
 
 # =========================================================
@@ -507,12 +562,12 @@ if __name__ == '__main__':
             print("Digest sent (empty).")
             raise SystemExit(0)
 
-        # Single-pass for your normal volume; rare fallback if unusually large
+        # Normal path (single pass)
         if len(pool) <= MAX_SINGLE_PASS:
-            picks, model_used = select_top_k_via_json(pool, window_start, window_end)
+            picks, model_used = select_top_k_via_enhanced_json(pool, window_start, window_end)
             emails_by_id = {e["id"]: e for e in pool}
         else:
-            # Safety valve (unlikely): first reduce, then final JSON selection
+            # Rare safety valve: batch reduce, then final JSON selection
             batch_size = 30
             per_batch_pick = 8
             prelim = []
@@ -536,14 +591,13 @@ if __name__ == '__main__':
                 for idx in idxs:
                     if isinstance(idx, int) and 1 <= idx <= len(chunk):
                         prelim.append(chunk[idx-1])
-            # Dedup by subject+domain
             dedup = {(p['subject'], p['from_domain']): p for p in prelim}
             final_pool = list(dedup.values())
 
-            picks, model_used = select_top_k_via_json(final_pool, window_start, window_end)
+            picks, model_used = select_top_k_via_enhanced_json(final_pool, window_start, window_end)
             emails_by_id = {e["id"]: e for e in final_pool}
 
-        # Compose plain + HTML bodies
+        # Compose and send
         plain = render_text_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
         html_body = render_html_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
         subject = f"AI Email Digest — {_dt.now().strftime('%Y-%m-%d')} (model: {model_used}; considered {len(pool)})"
