@@ -39,4 +39,17 @@ jobs:
           printf "OPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
             "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
 
-      - run: python main.py
+      - name: Show START time (UTC & SGT)
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          date -u +"UTC: %Y-%m-%d %H:%M:%S"
+          TZ=Asia/Singapore date +"SGT: %Y-%m-%d %H:%M:%S"
+
+      - name: Run digest
+        run: python main.py
+      
+      - name: Show END time (UTC & SGT)
+        if: always()  # log even if the script fails
+        run: |
+          date -u +"UTC: %Y-%m-%d %H:%M:%S"
+          TZ=Asia/Singapore date +"SGT: %Y-%m-%d %H:%M:%S"
