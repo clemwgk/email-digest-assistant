@@ -1,8 +1,10 @@
 import os
+import sys
 import datetime
 import base64
 import re
 import html
+import json
 import smtplib
 import traceback
 import time
@@ -31,7 +33,7 @@ if os.getenv("DISABLE_DIGEST", "").strip() == "1":
 # =========================================================
 # Env & OpenAI client
 # =========================================================
-load_dotenv()  # no-op in Actions unless you create .env; useful locally
+load_dotenv()  # no-op in Actions unless .env exists; useful locally
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Model fallback + retries
@@ -43,10 +45,11 @@ MODEL_CANDIDATES = [
 MAX_RETRIES = 2
 BASE_BACKOFF = 2.0  # seconds
 
-# Pool and snippet tuning
-MAX_SINGLE_PASS = 60      # single-pass if pool <= this; else rare fallback
-SNIPPET_LEN     = 220     # characters per email snippet
-DEADLINE_WORDS  = ["invoice", "bill", "payment", "due", "pay by", "action required", "iras", "mom", "hdb", "bank"]
+# Tunables
+MAX_SINGLE_PASS = 60                              # single-pass if pool <= this; else rare fallback
+SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "300"))  # ↑ from 220 → 300
+TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))  # SGD threshold for txn alerts
+DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action required", "iras", "mom", "hdb", "bank"]
 
 # Gmail scope
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -78,7 +81,7 @@ def authenticate_gmail():
 # =========================================================
 # Email sending
 # =========================================================
-def send_digest_email(subject, body_text):
+def send_digest_email(subject: str, body_text: str, html_body: str | None = None):
     sender = os.getenv("EMAIL_USERNAME")
     password = os.getenv("EMAIL_APP_PASSWORD")
     if not sender or not password:
@@ -90,16 +93,17 @@ def send_digest_email(subject, body_text):
     msg["To"] = recipient
     msg["Subject"] = subject
 
-    # Plain
+    # Plain text
     msg.attach(MIMEText(body_text, "plain"))
 
-    # Simple HTML wrapper that preserves Markdown-ish formatting
-    html_content = f"""
-    <html><body>
-      <pre style="font-family: monospace; font-size: 14px; white-space: pre-wrap;">{body_text}</pre>
-    </body></html>
-    """
-    msg.attach(MIMEText(html_content, "html"))
+    # HTML version
+    if html_body is None:
+        html_body = f"""
+        <html><body>
+          <pre style="font-family: monospace; font-size: 14px; white-space: pre-wrap;">{html.escape(body_text)}</pre>
+        </body></html>
+        """
+    msg.attach(MIMEText(html_body, "html"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(sender, password)
@@ -107,7 +111,8 @@ def send_digest_email(subject, body_text):
 
 def send_error_email(subject, error_text):
     try:
-        send_digest_email(subject, f"Email digest failed.\n\nDetails:\n{error_text}")
+        html_err = f"<html><body><pre style='font-family:monospace;white-space:pre-wrap'>{html.escape(error_text)}</pre></body></html>"
+        send_digest_email(subject, f"Email digest failed.\n\nDetails:\n{error_text}", html_err)
     except Exception as e:
         print("Failed to send error email:", e)
 
@@ -179,6 +184,32 @@ def get_last_run_timestamp(service) -> int:
         return fallback
 
 # =========================================================
+# Transaction amount parsing (for bank alerts)
+# =========================================================
+AMOUNT_RE = re.compile(r'(?i)\b(?:SGD|S\$|\$|USD|US\$|AUD|EUR|GBP)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:[.,][0-9]{2})|[0-9]+(?:[.,][0-9]{2})?)')
+
+def parse_txn_amount(subject: str, snippet: str):
+    """
+    Returns (is_txn_alert: bool, currency: str|None, amount: float|None).
+    Lightweight parser for subjects/snippets like:
+    'UOB - Transaction Alert (SGD 43.70 at STARHUB EPAYMENT)'
+    """
+    text = f"{subject} {snippet}"
+    if "transaction alert" not in text.lower():
+        return (False, None, None)
+    m = AMOUNT_RE.search(text)
+    if not m:
+        return (True, None, None)
+    raw = m.group(0).strip()
+    cur = "SGD" if re.search(r'(?i)sgd|s\$', raw) else ("USD" if re.search(r'(?i)usd|us\$', raw) else None)
+    num = re.sub(r'[^0-9.,]', '', raw).replace(',', '')
+    try:
+        amt = float(num)
+    except Exception:
+        amt = None
+    return (True, cur, amt)
+
+# =========================================================
 # Fetch all emails since watermark (OTP drop + thread dedupe)
 # =========================================================
 def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
@@ -186,6 +217,7 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
     Build the full pool since the last run.
     - Drop obvious OTP/verification emails.
     - Keep the latest per thread; keep older items only if they contain deadline words.
+    - Annotate transaction alerts with parsed amount/currency.
     """
     query = f'after:{since_unix}'
     pool = []
@@ -219,6 +251,8 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
                 except Exception:
                     pass
 
+            is_txn, cur, amt = parse_txn_amount(subject, snippet)
+
             item = {
                 'id': m['id'],
                 'threadId': thread_id,
@@ -227,6 +261,9 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
                 'subject': subject,
                 'snippet': snippet,
                 'has_deadline_word': any(w in combined for w in DEADLINE_WORDS),
+                'txn_alert': is_txn,
+                'txn_currency': cur,
+                'txn_amount': amt,
             }
 
             prev = latest_by_thread.get(thread_id)
@@ -245,7 +282,7 @@ def fetch_all_since(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
     return pool
 
 # =========================================================
-# GPT fallback + prompts
+# GPT: fallback + JSON selection (no hallucinations)
 # =========================================================
 def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     """
@@ -275,40 +312,172 @@ def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     combined = "\n".join([f"[{model}] {err}" for model, err in errors])
     raise RuntimeError(f"All GPT model calls failed.\n{combined}")
 
-def build_single_pass_prompt(emails):
-    base = (
+def build_selection_prompt_json(emails):
+    """
+    JSON-only selection to prevent hallucinations.
+    Includes txn flags so the model can apply the amount threshold rule.
+    """
+    K = min(5, len(emails))
+    header = (
         "You are a personal email triage assistant.\n\n"
-        "Context:\n"
-        "- These are ALL emails since the last digest run.\n"
-        "- Always return exactly **5 emails**, ranked most→least important.\n"
-        "- If none are critical, still choose the best 5.\n\n"
+        "INPUT:\n"
+        f"- EMAIL_COUNT: {len(emails)}\n"
+        f"- RETURN_COUNT: {K}\n"
+        "- Each item includes: id, from_domain, subject, snippet, time, txn_alert (bool), txn_amount (number|null), txn_currency.\n\n"
+        "TASK:\n"
+        f"Select the top {K} emails that most warrant attention.\n\n"
         "Ranking rules (strict):\n"
         "1) Action > Notification.\n"
-        "2) Legal/Government/Billing/Payment matters first—esp. deadlines or required responses.\n"
+        "2) Legal/Government/Billing/Payment first—especially deadlines or required responses.\n"
         "3) Bills/payment due always matter.\n"
         "4) Social media last; include only if nothing better exists.\n"
-        "5) Avoid duplicates (similar thread/topic).\n\n"
-        "For each selected email provide:\n"
-        "- **Type**: \"Call to Action\" OR \"For Information Only\"\n"
-        "- **Category**: Legal | Government | Billing/Payment | Other\n"
-        "- **Why (1–2 lines)**\n\n"
-        "Output format (Markdown):\n"
-        "# Today’s Top 5 Emails\n"
-        "1. **<Subject>** — _<From domain>_\n"
-        "   - **Type:** ...\n"
-        "   - **Category:** ...\n"
-        "   - **Why:** ...\n\n"
-        "Now, here are the emails:\n"
+        "5) Avoid duplicates (same thread/topic).\n"
+        "6) **Bank card transaction alerts**: treat as lower priority **unless** any of the following:\n"
+        f"   - amount ≥ {TXN_ALERT_MIN} (assume SGD if currency missing)\n"
+        "   - contains terms like: declined, failed, suspicious, unauthorized, dispute, fraud\n"
+        "   - unusual merchant hints (use judgment)\n\n"
+        "RULES (CRITICAL):\n"
+        "- Select only from provided `id` values. DO NOT invent emails.\n"
+        "- If EMAIL_COUNT < 5, return exactly EMAIL_COUNT items.\n"
+        "- Output ONLY valid JSON in this schema and nothing else:\n"
+        '{\n'
+        '  "picks": [\n'
+        '    {"id": "<id>", "type": "Call to Action" | "For Information Only", '
+        '     "category": "Legal" | "Government" | "Billing/Payment" | "Other", '
+        '     "why": "<1–2 concise lines>"}\n'
+        '  ]\n'
+        '}\n\n'
+        "EMAILS:\n"
     )
     lines = []
-    for i, e in enumerate(emails, 1):
+    for e in emails:
+        lines.append(json.dumps({
+            "id": e["id"],
+            "from_domain": e["from_domain"],
+            "subject": e["subject"],
+            "snippet": e["snippet"],
+            "time": datetime.datetime.fromtimestamp(e["timestamp"]).isoformat(),
+            "txn_alert": bool(e.get("txn_alert")),
+            "txn_amount": e.get("txn_amount"),
+            "txn_currency": e.get("txn_currency"),
+        }, ensure_ascii=False))
+    return header + "\n".join(lines)
+
+def parse_json_picks(raw: str, valid_ids: set, want_count: int):
+    """
+    Parse the model's JSON. Enforce: ids must be from valid_ids.
+    If parsing fails or fewer than needed, caller can add deterministic fallback.
+    """
+    picks = []
+    try:
+        m = re.search(r'\{.*\}', raw, re.S)
+        obj = json.loads(m.group(0) if m else raw)
+        for item in obj.get("picks", []):
+            _id = item.get("id")
+            _type = item.get("type")
+            _cat = item.get("category")
+            _why = item.get("why")
+            if _id in valid_ids and _type in ("Call to Action", "For Information Only") and \
+               _cat in ("Legal", "Government", "Billing/Payment", "Other") and isinstance(_why, str):
+                picks.append({"id": _id, "type": _type, "category": _cat, "why": _why.strip()})
+            if len(picks) >= want_count:
+                break
+    except Exception:
+        picks = []
+    return picks
+
+def render_text_digest(picks, emails_by_id, model_used, considered_count, window_start, window_end):
+    from datetime import datetime as _dt
+    header = (
+        f"# AI Email Digest ({_dt.now().strftime('%Y-%m-%d')})\n"
+        f"_Model: {model_used}_\n"
+        f"Considered: {considered_count} emails (from {window_start} to {window_end}).\n\n"
+        "# Today’s Top " + str(len(picks)) + " Emails\n"
+    )
+    lines = []
+    for i, p in enumerate(picks, 1):
+        e = emails_by_id[p["id"]]
         lines.append(
-            f"{i}. From domain: {e['from_domain']}\n"
-            f"   Subject: {e['subject']}\n"
-            f"   Snippet: {e['snippet']}\n"
-            f"   Time: {datetime.datetime.fromtimestamp(e['timestamp']).isoformat()}\n"
+            f"{i}. **{e['subject']}** — _{e['from_domain']}_\n"
+            f"   - **Type:** {p['type']}\n"
+            f"   - **Category:** {p['category']}\n"
+            f"   - **Why:** {p['why']}\n"
+            f"   - **Snippet:** {e['snippet']}\n"
         )
-    return base + "\n".join(lines)
+    return header + ("\n".join(lines) if lines else "_No eligible emails._")
+
+def _badge(label: str, bg: str, color: str = "#111"):
+    return f"<span style='display:inline-block;padding:2px 6px;border-radius:12px;background:{bg};color:{color};font-size:12px;font-weight:600'>{html.escape(label)}</span>"
+
+def render_html_digest(picks, emails_by_id, model_used, considered_count, window_start, window_end):
+    # Simple, Gmail-friendly inline-CSS layout
+    items_html = []
+    for i, p in enumerate(picks, 1):
+        e = emails_by_id[p["id"]]
+        subj = html.escape(e["subject"])
+        dom = html.escape(e["from_domain"])
+        snip = html.escape(e["snippet"])
+        # badges
+        type_bg = "#fde68a" if p["type"] == "Call to Action" else "#dbeafe"  # amber vs blue
+        cat_bg_map = {"Legal": "#fecaca", "Government": "#fde68a", "Billing/Payment": "#bbf7d0", "Other": "#e5e7eb"}
+        cat_bg = cat_bg_map.get(p["category"], "#e5e7eb")
+        txn_chip = ""
+        if e.get("txn_alert"):
+            amt = e.get("txn_amount")
+            cur = e.get("txn_currency") or "SGD"
+            if amt is not None:
+                over = amt >= TXN_ALERT_MIN
+                txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#bbf7d0" if over else "#e5e7eb")
+            else:
+                txn_chip = _badge("Txn alert", "#e5e7eb")
+        items_html.append(f"""
+          <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:10px 0;background:#ffffff">
+            <div style="font-weight:700;font-size:15px;line-height:1.3;margin-bottom:4px">{i}. {subj}</div>
+            <div style="color:#6b7280;font-size:13px;margin-bottom:8px">{dom}</div>
+            <div style="margin-bottom:8px">
+              {_badge(p["type"], type_bg)}
+              <span style="display:inline-block;width:6px"></span>
+              {_badge(p["category"], cat_bg)}
+              {'<span style="display:inline-block;width:6px"></span>' + txn_chip if txn_chip else ''}
+            </div>
+            <div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> {html.escape(p['why'])}</div>
+            <div style="font-size:12px;color:#6b7280"><strong>Snippet:</strong> {snip}</div>
+          </div>
+        """)
+    items_html = "\n".join(items_html) if items_html else "<p><em>No eligible emails.</em></p>"
+
+    title = f"AI Email Digest ({datetime.datetime.now().strftime('%Y-%m-%d')})"
+    header_html = f"""
+      <div style="font-family:Inter,Segoe UI,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px 12px;background:#f8fafc">
+        <h2 style="margin:0 0 4px 0;font-size:20px">{html.escape(title)}</h2>
+        <div style="color:#6b7280;font-size:12px;margin-bottom:12px">
+          Model: <strong>{html.escape(model_used)}</strong> · Considered: <strong>{considered_count}</strong> emails · Window: {html.escape(window_start)} → {html.escape(window_end)}
+        </div>
+        {items_html}
+        <div style="color:#9ca3af;font-size:11px;margin-top:12px">— Generated by your Email Digest Assistant</div>
+      </div>
+    """
+    return f"<html><body>{header_html}</body></html>"
+
+def select_top_k_via_json(pool, window_start, window_end):
+    """Single entry point for JSON-based selection with deterministic fallback."""
+    want = min(5, len(pool))
+    prompt = build_selection_prompt_json(pool)
+    messages = [{"role": "user", "content": prompt}]
+    raw, model_used = call_gpt_with_fallback(messages)
+
+    valid_ids = {e["id"] for e in pool}
+    picks = parse_json_picks(raw, valid_ids, want)
+
+    # Deterministic fallback if model output is empty/invalid
+    if len(picks) < want:
+        missing = want - len(picks)
+        chosen = {p["id"] for p in picks}
+        fallback_items = [e for e in pool if e["id"] not in chosen][:missing]
+        picks += [{"id": e["id"], "type": "For Information Only", "category": "Other",
+                   "why": "Selected by fallback (newest) due to invalid/empty model output."}
+                  for e in fallback_items]
+    return picks, model_used
 
 # =========================================================
 # Main
@@ -328,26 +497,25 @@ if __name__ == '__main__':
         # If nothing to consider, send a short note
         if not pool:
             subject = f"AI Email Digest — {_dt.now().strftime('%Y-%m-%d')} (empty)"
-            body = (
+            plain = (
                 f"# AI Email Digest ({_dt.now().strftime('%Y-%m-%d')})\n"
                 f"Considered: 0 emails (from {window_start} to {window_end}).\n\n"
                 f"No emails met the criteria."
             )
-            send_digest_email(subject, body)
+            html_body = render_html_digest([], {}, "n/a", 0, window_start, window_end)
+            send_digest_email(subject, plain, html_body)
             print("Digest sent (empty).")
             raise SystemExit(0)
 
-        # Single-pass for your normal volume; rare fallback if pool is unusually large
+        # Single-pass for your normal volume; rare fallback if unusually large
         if len(pool) <= MAX_SINGLE_PASS:
-            prompt = build_single_pass_prompt(pool)
-            messages = [{"role": "user", "content": prompt}]
-            summary, model_used = call_gpt_with_fallback(messages)
+            picks, model_used = select_top_k_via_json(pool, window_start, window_end)
+            emails_by_id = {e["id"]: e for e in pool}
         else:
-            # Simple safety valve: chunk and ask for top candidates, then final top-5.
-            # You likely won't hit this, but it keeps costs sane on spike days.
+            # Safety valve (unlikely): first reduce, then final JSON selection
             batch_size = 30
             per_batch_pick = 8
-            picks = []
+            prelim = []
             for i in range(0, len(pool), batch_size):
                 chunk = pool[i:i+batch_size]
                 brief_prompt = (
@@ -367,24 +535,20 @@ if __name__ == '__main__':
                     idxs = list(range(1, min(per_batch_pick, len(chunk)) + 1))
                 for idx in idxs:
                     if isinstance(idx, int) and 1 <= idx <= len(chunk):
-                        picks.append(chunk[idx-1])
+                        prelim.append(chunk[idx-1])
             # Dedup by subject+domain
-            dedup = {(p['subject'], p['from_domain']): p for p in picks}
+            dedup = {(p['subject'], p['from_domain']): p for p in prelim}
             final_pool = list(dedup.values())
-            prompt = build_single_pass_prompt(final_pool)
-            messages = [{"role": "user", "content": prompt}]
-            summary, model_used = call_gpt_with_fallback(messages)
 
-        # Compose + send
-        header = (
-            f"# AI Email Digest ({_dt.now().strftime('%Y-%m-%d')})\n"
-            f"_Model: {model_used}_\n"
-            f"Considered: {len(pool)} emails (from {window_start} to {window_end}).\n\n"
-        )
-        body = header + (summary or "No content returned.")
+            picks, model_used = select_top_k_via_json(final_pool, window_start, window_end)
+            emails_by_id = {e["id"]: e for e in final_pool}
+
+        # Compose plain + HTML bodies
+        plain = render_text_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
+        html_body = render_html_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
         subject = f"AI Email Digest — {_dt.now().strftime('%Y-%m-%d')} (model: {model_used}; considered {len(pool)})"
 
-        send_digest_email(subject, body)
+        send_digest_email(subject, plain, html_body)
         print("Digest sent.")
 
     except Exception as e:
