@@ -12,3 +12,32 @@ __pycache__/
 .vscode/       # VS Code workspace settings (personal)
 .idea/         # JetBrains IDE settings (personal)
 .DS_Store      # macOS folder view settings (irrelevant to code)
+
+# --- Python virtual envs (avoid committing local env) ---
+.venv/
+venv/
+env/
+
+# --- Logs & local outputs ---
+*.log
+logs/
+
+# --- Tool caches & test artifacts ---
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# --- Notebooks (optional; keep if you don't want to publish them) ---
+.ipynb_checkpoints/
+
+# --- Broader secret/material patterns (belt & suspenders) ---
+credentials*.json
+token*.json
+*.pem
+*.key
+*.crt
+
+# --- Windows artifacts ---
+Thumbs.db
