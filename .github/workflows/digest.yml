@@ -18,18 +18,29 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
       EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+
     steps:
+      # NEW: earliest possible timing marker to measure queue delay
+      - name: Log JOB START (UTC & SGT) + cron
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Cron expr (if scheduled): ${{ github.event.schedule || 'n/a' }}"
+          date -u +"Job start UTC: %Y-%m-%d %H:%M:%S"
+          TZ=Asia/Singapore date +"Job start SGT: %Y-%m-%d %H:%M:%S"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Optional: cache pip to reduce setup time variance
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
 
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ⬇️ decode base64 secrets back into JSON files
       - name: Recreate credentials.json and token.json from Secrets (base64)
         run: |
           echo "${{ secrets.GMAIL_CREDENTIALS_JSON_B64 }}" | base64 --decode > credentials.json
@@ -39,17 +50,19 @@ jobs:
           printf "OPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
             "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
 
-      - name: Show START time (UTC & SGT)
+      # UPDATED: wrap python with its own start/end stamps
+      - name: Run digest (with timing)
         run: |
-          echo "Event: ${{ github.event_name }}"
+          echo "Python start:"
+          date -u +"UTC: %Y-%m-%d %H:%M:%S"
+          TZ=Asia/Singapore date +"SGT: %Y-%m-%d %H:%M:%S"
+          python main.py
+          echo "Python end:"
           date -u +"UTC: %Y-%m-%d %H:%M:%S"
           TZ=Asia/Singapore date +"SGT: %Y-%m-%d %H:%M:%S"
 
-      - name: Run digest
-        run: python main.py
-      
-      - name: Show END time (UTC & SGT)
-        if: always()  # log even if the script fails
+      - name: Log JOB END (UTC & SGT)
+        if: always()
         run: |
-          date -u +"UTC: %Y-%m-%d %H:%M:%S"
-          TZ=Asia/Singapore date +"SGT: %Y-%m-%d %H:%M:%S"
+          date -u +"Job end UTC: %Y-%m-%d %H:%M:%S"
+          TZ=Asia/Singapore date +"Job end SGT: %Y-%m-%d %H:%M:%S"
