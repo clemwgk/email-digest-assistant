@@ -15,7 +15,7 @@ from email.mime.multipart import MIMEMultipart
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai import APIError, RateLimitError, APIConnectionError, APITimeoutError
+from openai import APIError, RateLimitError, APIConnectionError, APITimeoutError, NotFoundError
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -36,7 +36,7 @@ if os.getenv("DISABLE_DIGEST", "").strip() == "1":
 load_dotenv()  # no-op in Actions unless .env exists; useful locally
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Model fallback order — preserved from your repo, with retries bumped to 4
+# Model fallback + retries (restored to your preferred order)
 MODEL_CANDIDATES = [
     "gpt-5-mini",
     "gpt-5-nano",
@@ -44,16 +44,21 @@ MODEL_CANDIDATES = [
     "gpt-4o-mini",
     "gpt-3.5-turbo",
 ]
-MAX_RETRIES = 4           # ⬅️ increased from 2 → 4 (your request)
-BASE_BACKOFF = 2.0        # seconds (2s, 4s, 6s, 8s)
+MAX_RETRIES = 4
+BASE_BACKOFF = 2.0  # seconds
 
-# Tunables (preserved defaults)
+# Tunables
 MAX_SINGLE_PASS = 60
 SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "350"))
-TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))
+TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))                 # small-amount demotion threshold
+TXN_HIGH_ALERT_MIN = float(os.getenv("TXN_HIGH_ALERT_MIN", str(TXN_ALERT_MIN)))  # high amount emphasis
 
-# Deadline cues (preserved from your published version)
-DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action required"]
+# Optional: issuer/card domains for soft gating of no-verb transactions
+_issuer_raw = os.getenv("ISSUER_DOMAINS", "")
+ISSUER_DOMAINS = {d.strip().lower() for d in _issuer_raw.split(",") if d.strip()}
+
+# Deadline cues
+DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action required", "iras", "mom", "hdb", "bank"]
 
 # Gmail scope
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -127,19 +132,39 @@ def send_error_email(subject, error_text):
         print("Failed to send error email:", e)
 
 # =========================================================
-# Body extraction + decimal-fix
+# Body extraction + decimal-fix + card-last4 neutralization
 # =========================================================
-TAG_RE = re.compile(r"<[^>]+>")
+BLOCK_TAGS = re.compile(r'</?(?:p|br|div|li|tr|td|th|h[1-6]|hr)[^>]*>', re.I)
+ANY_TAG    = re.compile(r'<[^>]+>')
 DECIMAL_JOIN_RE = re.compile(r'(\d+)\.\s+(\d{2})(\b)')  # join "25. \n76" → "25.76"
+
+CARD_LAST4_PATTERNS = [
+    r'(?:\*{2,}|•{2,}|x{2,})\s*\d{4}\b',
+    r'\b(?:ending|last\s*4(?:\s*digits)?|last four)\s*[:#-]?\s*\d{4}\b',
+    r'\b(?:visa|mastercard|amex|card)\s*(?:\*{2,}|•{2,}|x{2,})\s*\d{4}\b',
+    r'\bcard\s*(?:no\.?|number)[:#-]?\s*(?:\*{2,}|•{2,}|x{2,})?\s*\d{4}\b',
+]
 
 def _fix_split_decimals(text: str) -> str:
     return DECIMAL_JOIN_RE.sub(r'\1.\2\3', text)
 
+def _neutralize_card_last4(text: str) -> str:
+    for pat in CARD_LAST4_PATTERNS:
+        text = re.sub(pat, ' CARDLAST4 ', text, flags=re.IGNORECASE)
+    return text
+
 def _clean_html_to_text(html_str: str) -> str:
-    return TAG_RE.sub("", html.unescape(html_str))
+    # Preserve block boundaries to avoid "8652$29.98" concatenation,
+    # then strip remaining tags and normalize whitespace.
+    txt = BLOCK_TAGS.sub('\n', html_str)
+    txt = ANY_TAG.sub(' ', txt)
+    txt = html.unescape(txt)
+    txt = re.sub(r'[ \t\r\f\v]+', ' ', txt)
+    txt = re.sub(r'\n{2,}', '\n', txt)
+    return txt.strip()
 
 def _extract_full_body_text(msg_data) -> str:
-    """Extract full body text from Gmail message payload; prefer text/plain but strip HTML; fix split decimals."""
+    """Extract full body text from Gmail message payload; prefer text/plain, fallback to text/html; fix decimals + last4."""
     try:
         payload = msg_data.get("payload", {})
 
@@ -147,6 +172,7 @@ def _extract_full_body_text(msg_data) -> str:
         body_data = payload.get("body", {}).get("data")
         if body_data:
             text = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="ignore")
+            text = _neutralize_card_last4(text)
             return _fix_split_decimals(text.strip())
 
         # 2) Walk nested parts (stack DFS)
@@ -163,10 +189,13 @@ def _extract_full_body_text(msg_data) -> str:
                 stack.extend(parts)
             if part_body and mime == "text/plain":
                 text = base64.urlsafe_b64decode(part_body).decode("utf-8", errors="ignore")
+                text = _neutralize_card_last4(text)
                 full_texts.append(text.strip())
             elif part_body and mime == "text/html":
                 html_txt = base64.urlsafe_b64decode(part_body).decode("utf-8", errors="ignore")
-                full_texts.append(_clean_html_to_text(html_txt).strip())
+                text = _clean_html_to_text(html_txt)
+                text = _neutralize_card_last4(text)
+                full_texts.append(text.strip())
 
         return _fix_split_decimals("\n".join(full_texts))
     except Exception:
@@ -185,28 +214,32 @@ AMT_CURRENCY_RE = re.compile(
 TXN_POSITIVE_WORDS = [
     'transaction alert','charged','spent','purchase','payment made','transfer',
     'debit','withdrawal','pos','merchant','card ending','authorized','unauthorized',
-    'declined','failed'
+    'declined','failed','receipt','invoice','order #','order number','payment received'
 ]
 TXN_NEGATIVE_CONTEXT = [
-    # statements/advice/non-action contexts
     'statement','estatement','advice ready','available for viewing','monthly statement',
     'account summary','balance summary','available credit','credit limit',
     'interest rate','fx rate','exchange rate'
 ]
+# Extra promo/news negatives (prevents “spend S$300 to get S$7” from becoming a transaction)
+NEG_PROMO = re.compile(r'\b(promo|voucher|coupon|discount|deal|offer|cashback|rebate|'
+                       r'save\b|spend\b|min(?:imum)?\s*spend|'
+                       r'earn\s+miles|miles\b|shop now|sale|limited time)\b', re.I)
+NEG_MARKET = re.compile(r'\b(market|index|price|prices|bitcoin|btc|eth|nasdaq|s&p|dow)\b', re.I)
+NEG_COVER  = re.compile(r'\b(insurance|coverage|per depositor|sdic|pdic)\b', re.I)
+NEG_NEWS   = re.compile(r'\b(newsletter|view online|unsubscribe|sponsored)\b', re.I)
 
 def _nearest_score_to_keywords(text: str, span: tuple[int, int]) -> int:
-    """Simple score: presence of txn keywords within ~120 chars window around span."""
+    """Simple score: presence of txn keywords within ~120 chars around span, minus negative contexts."""
     s, e = span
     win_s = max(0, s - 120)
     win_e = min(len(text), e + 120)
     window = text[win_s:win_e].lower()
     score = 0
     for kw in TXN_POSITIVE_WORDS:
-        if kw in window:
-            score += 2
+        if kw in window: score += 2
     for bad in TXN_NEGATIVE_CONTEXT:
-        if bad in window:
-            score -= 2
+        if bad in window: score -= 2
     return score
 
 def _parse_amount_from_text(cleaned_text: str) -> Optional[tuple[str, float, tuple[int,int], str]]:
@@ -221,19 +254,13 @@ def _parse_amount_from_text(cleaned_text: str) -> Optional[tuple[str, float, tup
     # currency-first
     for m in CUR_AMOUNT_RE.finditer(cleaned_text):
         end = m.end()
-        # Guard against immediate percent sign
         if end < len(cleaned_text) and cleaned_text[end:end+1] == '%':
             continue
         raw_num = m.group(1)
         num = float(raw_num.replace(',', ''))
         raw_span = (m.start(), m.end())
-        # Currency heuristic
-        cur = "SGD"
         prefix = cleaned_text[m.start():m.end()].upper()
-        if "USD" in prefix or "US$" in prefix:
-            cur = "USD"
-        elif "SGD" in prefix or "S$" in prefix or "$" in prefix:
-            cur = "SGD"  # default assumption for your inbox
+        cur = "USD" if ("USD" in prefix or "US$" in prefix) else "SGD"
         score = _nearest_score_to_keywords(cleaned_text, raw_span)
         candidates.append((cur, num, raw_span, "cur-first", score))
 
@@ -246,11 +273,7 @@ def _parse_amount_from_text(cleaned_text: str) -> Optional[tuple[str, float, tup
         num = float(raw_num.replace(',', ''))
         raw_span = (m.start(), m.end())
         suffix = cleaned_text[m.start():m.end()].upper()
-        cur = "SGD"
-        if "USD" in suffix or "US$" in suffix:
-            cur = "USD"
-        elif "SGD" in suffix or "S$" in suffix or "$" in suffix:
-            cur = "SGD"
+        cur = "USD" if ("USD" in suffix or "US$" in suffix) else "SGD"
         score = _nearest_score_to_keywords(cleaned_text, raw_span)
         candidates.append((cur, num, raw_span, "amt-first", score))
 
@@ -314,7 +337,6 @@ def _extract_smart_snippet_v2(full_text: str, max_len: int, preferred_span: Opti
 
     merged = _merge_spans(spans)
 
-    # Stitch windows until max_len
     pieces, total = [], 0
     for s, e in merged:
         chunk = text[s:e]
@@ -348,35 +370,47 @@ def get_last_run_timestamp(service) -> int:
         return fallback
 
 # =========================================================
-# Transaction detection (precise; authoritative amount + low-amount tag)
+# Transaction detection (issuer/promo aware; amount never enough on its own)
 # =========================================================
-def enhanced_txn_detection_v2(subject: str, full_text: str,
+def _issuer_like(from_domain: str) -> bool:
+    return any(from_domain.endswith(dom) for dom in ISSUER_DOMAINS) if ISSUER_DOMAINS else False
+
+def enhanced_txn_detection_v2(subject: str,
+                              full_text: str,
                               parsed_currency: Optional[str],
-                              parsed_amount: Optional[float]):
+                              parsed_amount: Optional[float],
+                              from_domain: str) -> Tuple[bool, Optional[str], Optional[float], bool]:
     """
     Decide if this is a real transaction alert vs statement/info.
     Returns: (is_txn_alert, currency, amount, txn_small_flag)
+    Rules:
+      - Amount alone is NOT sufficient.
+      - Accept when txn verbs / receipt terms present; OR
+        when issuer-like sender and amount present.
+      - Promo/news/market/coverage contexts demote to non-txn unless explicit txn wording exists.
     """
-    text = f"{subject} {full_text}".lower()
+    tl = f"{subject} {full_text}".lower()
 
-    # Exclude statements/advice and non-action contexts
-    if any(ind in text for ind in TXN_NEGATIVE_CONTEXT):
+    # Exclude statements/advice and generic non-action contexts
+    if any(ind in tl for ind in TXN_NEGATIVE_CONTEXT):
+        return (False, None, None, False)
+    if (NEG_PROMO.search(tl) or NEG_MARKET.search(tl) or NEG_COVER.search(tl) or NEG_NEWS.search(tl)) and not any(kw in tl for kw in TXN_POSITIVE_WORDS):
         return (False, None, None, False)
 
-    # Positive indicators
-    is_txn = any(ind in text for ind in TXN_POSITIVE_WORDS)
-    if not is_txn and parsed_amount is None:
-        return (False, None, None, False)
+    txn_verby = any(kw in tl for kw in TXN_POSITIVE_WORDS)
+    issuerish = _issuer_like(from_domain)
 
-    cur = parsed_currency
+    # If there is no txn wording, allow only with issuer + amount present.
+    if not txn_verby:
+        if not (issuerish and parsed_amount is not None):
+            return (False, None, None, False)
+
+    # From here, we consider it a txn alert
+    cur = parsed_currency or "SGD"
     amt = parsed_amount
     small = False
-    if amt is not None:
-        if amt < TXN_ALERT_MIN:
-            small = True
-        if cur is None:
-            cur = "SGD"  # default assumption for your inbox
-
+    if amt is not None and amt < TXN_ALERT_MIN:
+        small = True
     return (True, cur, amt, small)
 
 # =========================================================
@@ -390,8 +424,10 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
     Plus:
       - Drop OTP/2FA emails
       - Keep latest per thread; keep older items only if they contain deadline words
+      - Exclude past digests from pool
     """
-    query = f'after:{since_unix}'
+    # Exclude past digests and restrict to inbox
+    query = f'in:inbox after:{since_unix} -subject:"AI Email Digest —"'
     pool = []
     page_token = None
     latest_by_thread: dict[str, dict] = {}
@@ -408,6 +444,9 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             payload = msg.get('payload', {})
             headers = payload.get('headers', [])
             subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+            if subject.startswith("AI Email Digest —"):
+                continue  # hard guard against including our own digests
+
             sender = next((h['value'] for h in headers if h['name'] == 'From'), 'N/A')
             ts = int(msg.get('internalDate', '0')) // 1000
             thread_id = msg.get('threadId')
@@ -436,8 +475,8 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
                 except Exception:
                     pass
 
-            # Transaction detection using authoritative amount
-            is_txn, cur, amt, small = enhanced_txn_detection_v2(subject, full_body, parsed_cur, parsed_amt)
+            # Transaction detection using authoritative amount + issuer/promo logic
+            is_txn, cur, amt, small = enhanced_txn_detection_v2(subject, full_body, parsed_cur, parsed_amt, from_domain)
 
             item = {
                 'id': m['id'],
@@ -455,7 +494,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 
             # DEBUG observability for txn emails
             if DEBUG and is_txn:
-                debug_print(f"[TXN] subj={subject!r} amount={amt} {cur} small={small} snippet={snippet[:120]!r}")
+                debug_print(f"[TXN] subj={subject!r} amount={amt} {cur} small={small} issuer={from_domain} snippet={snippet[:160]!r}")
 
             prev = latest_by_thread.get(thread_id)
             if not prev or ts >= prev['timestamp']:
@@ -478,6 +517,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     """
     Try each model with light retry/backoff. Return (content, model_used).
+    - NotFoundError (404 model missing) skips retries for that model immediately.
     """
     errors = []
     for m in MODEL_CANDIDATES:
@@ -491,6 +531,10 @@ def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
                 content = resp.choices[0].message.content
                 if content and content.strip():
                     return content, m
+            except NotFoundError as e:
+                # model doesn't exist / not accessible — skip retries for this model
+                errors.append((f"{m} attempt {attempt}", f"NotFoundError: {e}"))
+                break
             except (RateLimitError, APIError, APIConnectionError, APITimeoutError) as e:
                 errors.append((f"{m} attempt {attempt}", f"{e.__class__.__name__}: {e}"))
                 if attempt < MAX_RETRIES:
@@ -636,8 +680,8 @@ def render_html_digest(picks, emails_by_id, model_used, considered_count, window
         if e.get("txn_alert"):
             amt = e.get("txn_amount"); cur = e.get("txn_currency") or "SGD"
             if amt is not None:
-                over = amt >= TXN_ALERT_MIN
-                txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#bbf7d0" if over else "#e5e7eb")
+                over = amt >= TXN_HIGH_ALERT_MIN
+                txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#fecaca" if over else "#bbf7d0")  # red-ish if high
             else:
                 txn_chip = _badge("Txn alert", "#e5e7eb")
         items_html.append(f"""
