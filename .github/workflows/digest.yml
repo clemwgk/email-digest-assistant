@@ -18,6 +18,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
       EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+      ISSUER_DOMAINS: ${{ secrets.ISSUER_DOMAINS }}
 
     steps:
       # NEW: earliest possible timing marker to measure queue delay
