@@ -23,6 +23,8 @@ from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 
+from zoneinfo import ZoneInfo
+
 # =========================================================
 # Kill switch (pause runs without errors)
 # =========================================================
@@ -62,6 +64,15 @@ DEADLINE_WORDS = ["invoice", "bill", "payment", "due", "pay by", "action require
 
 # Gmail scope
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+# Inbox filter toggle: by default, include archived mail too
+STRICT_INBOX = os.getenv("STRICT_INBOX", "0") == "1"  # 0 = include archived, 1 = inbox only
+
+# Display timezone for the email (selection window still UTC)
+DISPLAY_TZ = ZoneInfo(os.getenv("DISPLAY_TZ", "Asia/Singapore"))
+
+# Watermark buffer in hours (protect against late previous digests)
+SINCE_BUFFER_HOURS = int(os.getenv("SINCE_BUFFER_HOURS", "6"))
 
 # Debug toggle
 DEBUG = os.getenv("DEBUG", "").strip() == "1"
@@ -369,6 +380,11 @@ def get_last_run_timestamp(service) -> int:
     except Exception:
         return fallback
 
+def _fmt_ts_local(epoch_s: int) -> str:
+    # Convert UTC epoch seconds to DISPLAY_TZ for user-friendly rendering
+    return datetime.datetime.fromtimestamp(epoch_s, tz=datetime.timezone.utc)\
+        .astimezone(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')
+
 # =========================================================
 # Transaction detection (issuer/promo aware; amount never enough on its own)
 # =========================================================
@@ -432,12 +448,36 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
     page_token = None
     latest_by_thread: dict[str, dict] = {}
 
+    # Build base query (exclude past digests)
+    base_q = f'after:{since_unix} -subject:"AI Email Digest —"'
+    query = f'in:inbox {base_q}' if STRICT_INBOX else base_q
+    page_token = None
+    pool = []
+    latest_by_thread = {}
+    
+    # Log the initial query once
+    if DEBUG:
+        print("[Query]", query)
+
     while True:
         res = service.users().messages().list(
             userId='me', q=query, maxResults=100, pageToken=page_token
         ).execute()
+        res = service.users().messages().list(userId='me', q=query, maxResults=100, pageToken=page_token).execute()
         msgs = res.get('messages', [])
         page_token = res.get('nextPageToken')
+        
+        # Fallback if the first page is empty: broaden to last 2 days without in:inbox
+        if not msgs and page_token is None:
+            if DEBUG:
+                print("[Query] 0 results. Trying fallback 'newer_than:2d -subject:\"AI Email Digest —\"'")
+            fallback_q = 'newer_than:2d -subject:"AI Email Digest —"'
+            res = service.users().messages().list(userId='me', q=fallback_q, maxResults=100).execute()
+            msgs = res.get('messages', [])
+            page_token = res.get('nextPageToken')
+        
+            msgs = res.get('messages', [])
+            page_token = res.get('nextPageToken')
 
         for m in msgs:
             msg = service.users().messages().get(userId='me', id=m['id'], format='full').execute()
@@ -483,6 +523,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
                 'threadId': thread_id,
                 'timestamp': ts,
                 'from_domain': from_domain,
+                'from_raw': sender,
                 'subject': subject,
                 'snippet': snippet,
                 'has_deadline_word': any(w in combined_lower for w in DEADLINE_WORDS),
@@ -715,6 +756,45 @@ def render_html_digest(picks, emails_by_id, model_used, considered_count, window
     """
     return f"<html><body>{header_html}</body></html>"
 
+
+def render_text_appendix(pool, cap=100):
+    lines = ["\n\n---\n## Appendix — All considered (" + str(len(pool)) + ")\n"]
+    for e in pool[:cap]:
+        lines.append(f"- [{_fmt_ts_local(e['timestamp'])}] {e.get('from_raw','?')} — {e['subject']}")
+    if len(pool) > cap:
+        lines.append(f"... and {len(pool)-cap} more")
+    return "\n".join(lines)
+
+def render_html_appendix(pool, cap=100):
+    rows = []
+    for e in pool[:cap]:
+        t = html.escape(_fmt_ts_local(e['timestamp']))
+        f = html.escape(e.get('from_raw','?'))
+        s = html.escape(e['subject'])
+        rows.append(
+            "<tr>"
+            f"<td style='padding:6px 8px;color:#6b7280;font-size:12px'>{t}</td>"
+            f"<td style='padding:6px 8px;font-size:12px'>{f}</td>"
+            f"<td style='padding:6px 8px;font-size:12px'>{s}</td>"
+            "</tr>"
+        )
+    more = ""
+    if len(pool) > cap:
+        more = f"<div style='color:#6b7280;font-size:12px;margin-top:6px'>… and {len(pool)-cap} more</div>"
+    table = (
+        "<table style='border-collapse:collapse;width:100%;margin-top:8px'>"
+        "<thead><tr>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>Time</th>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>From</th>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>Subject</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+    return (
+        "<div style='margin-top:14px'>"
+        "<h3 style='margin:0 0 6px 0;font-size:14px'>Appendix — All considered (" + str(len(pool)) + ")</h3>"
+        + table + more + "</div>"
+    )
+
 # =========================================================
 # Selection wrapper
 # =========================================================
@@ -746,15 +826,25 @@ if __name__ == '__main__':
     try:
         service = authenticate_gmail()
 
-        # Determine window
+    # (Optional) log which Gmail account we're actually reading, when DEBUG=1
+    try:
+        if DEBUG:
+                profile = service.users().getProfile(userId='me').execute()
+                print("Gmail API profile:", profile.get("emailAddress"))
+        except Exception as _e:
+            if DEBUG:
+                print("Profile check failed:", _e)
+        
+        # Determine window with a small safety buffer
         since_ts = get_last_run_timestamp(service)
+        since_ts = max(0, since_ts - SINCE_BUFFER_HOURS * 3600)
 
         # Use v2 pipeline (full body → amount → snippet → detection)
         pool = fetch_all_since_v2(service, since_unix=since_ts, snippet_len=SNIPPET_LEN)
 
         from datetime import datetime as _dt
-        window_start = _dt.fromtimestamp(since_ts).strftime('%Y-%m-%d %H:%M')
-        window_end = _dt.now().strftime('%Y-%m-%d %H:%M')
+        window_start = _dt.fromtimestamp(since_ts, tz=datetime.timezone.utc).astimezone(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')
+        window_end = _dt.now(tz=datetime.timezone.utc).astimezone(DISPLAY_TZ).strftime('%Y-%m-%d %H:%M')
 
         # If nothing to consider, send a short note
         if not pool:
@@ -805,10 +895,27 @@ if __name__ == '__main__':
             emails_by_id = {e["id"]: e for e in final_pool}
 
         # Compose and send
-        plain = render_text_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
-        html_body = render_html_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
         subject = f"AI Email Digest — {_dt.now().strftime('%Y-%m-%d')} (model: {model_used}; considered {len(pool)})"
 
+        plain = render_text_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end)
+        plain += render_text_appendix(pool, cap=100)
+        
+        # If your render_html_digest returns a complete HTML document, prefer adding an optional
+        # parameter to accept extra HTML. If you can edit that function signature, do this:
+        
+        # 1) Change the signature:
+        # def render_html_digest(..., extra_html: str = ""):
+        # and return: f"<html><body>{header_html}{items_html}{extra_html}</body></html>"
+        
+        # 2) Then call it like this:
+        appendix_html = render_html_appendix(pool, cap=100)
+        html_body = render_html_digest(picks, emails_by_id, model_used, len(pool), window_start, window_end, extra_html=appendix_html)
+        
+        # If you prefer not to change the signature, keep your current render_html_digest and
+        # do a simple concat if it already returns outer wrappers safely:
+        # html_body = render_html_digest(...)[:-14] + appendix_html + "</body></html>"
+
+        
         send_digest_email(subject, plain, html_body)
         print("Digest sent.")
 
