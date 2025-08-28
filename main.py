@@ -62,7 +62,7 @@ BASE_BACKOFF = 2.0  # seconds
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Triaging tunables
-SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "350"))            # ~how much context we send per email
+SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))            # ~how much context we send per email
 TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))      # demote "small" transactions below this
 TXN_HIGH_ALERT_MIN = float(os.getenv("TXN_HIGH_ALERT_MIN", str(TXN_ALERT_MIN)))
 ISSUER_DOMAINS = [d.strip().lower() for d in os.getenv("ISSUER_DOMAINS", "").split(",") if d.strip()]
