@@ -589,10 +589,7 @@ def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
     combined = "\n".join([f"[{model}] {err}" for model, err in errors])
     raise RuntimeError(f"All GPT model calls failed.\n{combined}")
 
-def build_enhanced_selection_prompt_json(emails: List[dict]) -> str:
-    """
-    Enhanced JSON-only selection with clear rules (no hallucination).
-    """
+def build_enhanced_selection_prompt_json(emails: list[dict]) -> str:
     K = min(5, len(emails))
     header = (
         "You are a personal email triage assistant.\n\n"
@@ -614,7 +611,12 @@ def build_enhanced_selection_prompt_json(emails: List[dict]) -> str:
         "   - contains terms like: declined, failed, suspicious, unauthorized, dispute, fraud\n"
         "   - unusual merchant hints (use judgment)\n"
         "7) Market/news/promos (e.g., Bitcoin price, coverage limits, discounts) are generally NOT transactions and should be deprioritized.\n"
-        "8) `issuer=true` is a weak prior; still deprioritize amounts without clear action/txn context.\n\n"
+        "8) `issuer=true` is a weak prior; still deprioritize amounts without clear action/txn context.\n"
+        # >>> YOUR NEW SUB-RULES (deterministic preference within Billing/Payment) <<<
+        "9) Within **Billing/Payment** emails:\n"
+        f"   - Any transaction with amount ≥ {TXN_ALERT_MIN} must outrank any transaction < {TXN_ALERT_MIN}, "
+        "unless the smaller one contains: declined, failed, unauthorized, suspicious, dispute, fraud.\n"
+        "   - If still tied, prefer explicit Call to Action, then newer.\n\n"
         "For each selection, provide details:\n"
         "- **why**: 2-3 sentences explaining: (1) what the email is about, (2) why it matters, (3) what might need to be done\n"
         "- **action**: specific action needed if any (e.g., 'Pay by Aug 20', 'Review and respond', 'No action needed')\n"
@@ -634,6 +636,7 @@ def build_enhanced_selection_prompt_json(emails: List[dict]) -> str:
         '}\n\n'
         "EMAILS:\n"
     )
+
     lines = []
     for e in emails:
         lines.append(json.dumps({
