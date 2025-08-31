@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 from openai import APIError, RateLimitError, APIConnectionError, APITimeoutError
 try:
-    from openai import NotFoundError  # present in openai>=1.x
+    from openai import NotFoundError  # openai>=1.x
 except Exception:  # pragma: no cover
     class NotFoundError(Exception):
         pass
@@ -62,8 +62,8 @@ BASE_BACKOFF = 2.0  # seconds
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Triaging tunables
-SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))            # ~how much context we send per email
-TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))      # demote "small" transactions below this
+SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))            # how much context we send per email
+TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))      # mark "small" transactions below this
 TXN_HIGH_ALERT_MIN = float(os.getenv("TXN_HIGH_ALERT_MIN", str(TXN_ALERT_MIN)))
 ISSUER_DOMAINS = [d.strip().lower() for d in os.getenv("ISSUER_DOMAINS", "").split(",") if d.strip()]
 
@@ -76,7 +76,7 @@ DISPLAY_TZ = ZoneInfo(os.getenv("DISPLAY_TZ", "Asia/Singapore"))
 # Watermark buffer in hours (protect against late previous digests)
 SINCE_BUFFER_HOURS = int(os.getenv("SINCE_BUFFER_HOURS", "6"))
 
-# Words that hint deadlines/action (keep older thread items if present)
+# Words that hint deadlines/action (weak signal; used only to keep older thread items)
 DEADLINE_WORDS = [
     "invoice", "bill", "payment", "due", "pay by",
     "action required", "deadline", "respond", "submit", "overdue",
@@ -239,6 +239,7 @@ NEGATIVE_STATEMENT_WORDS = {
     "monthly statement","balance summary","eadvice"
 }
 
+# Transaction verbs (EXCLUDES 'paynow' per your preference)
 TXN_VERBS = {
     "transaction alert","charged","purchase","payment made","receipt","debit","withdrawal",
     "pos","merchant","transfer","authorized","unauthorized","declined","failed","successful transaction",
@@ -250,7 +251,7 @@ TXN_VERBS = {
 def _parse_amounts_from_text(text: str) -> list[Tuple[str, float, Tuple[int,int]]]:
     """
     Return a list of (currency, amount_float, (start_idx, end_idx)) for all plausible amounts.
-    Skips percentages.
+    Skips percentages contexts.
     """
     out = []
     for m in AMOUNT_CURR_RE.finditer(text):
@@ -502,7 +503,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             if any(k in combined_lower for k in ['otp', 'verification code', '2fa', 'login code', 'one-time password']):
                 continue
 
-            # From domain (best-effort) + issuer flag
+            # From domain (best-effort)
             from_domain = sender
             if '@' in sender:
                 try:
@@ -521,7 +522,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             # Snippet around the chosen amount (or action/date hints)
             snippet = _extract_smart_snippet_v2(full_body, max_len=snippet_len, preferred_span=amount_span)
 
-            # Txn detection
+            # Txn detection (full-body, excludes 'PayNow' as trigger)
             is_txn, cur, amt, small = enhanced_txn_detection_v2(
                 subject, full_body, parsed_cur, parsed_amt, from_domain
             )
@@ -542,7 +543,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             }
 
             if DEBUG and is_txn:
-                debug_print(f"[TXN] subj={subject!r} amount={amt} {cur} small={small} issuer={from_domain} snippet={snippet[:160]!r}")
+                debug_print(f"[TXN] subj={subject!r} amount={amt} {cur} small={small} from={from_domain} snippet={snippet[:160]!r}")
 
             prev = latest_by_thread.get(thread_id)
             if not prev or ts >= prev['timestamp']:
@@ -580,7 +581,7 @@ def call_gpt_with_fallback(messages: List[dict]) -> Tuple[str, str]:
             except (NotFoundError, RateLimitError, APIError, APIConnectionError, APITimeoutError) as e:
                 errors.append((f"{m} attempt {attempt}", f"{e.__class__.__name__}: {e}"))
                 if attempt < MAX_RETRIES:
-                    time.sleep(BASE_BACKOFF * attempt)  # 2s, 4s, 6s, ...
+                    time.sleep(BASE_BACKOFF * attempt)  # 2s, 4s, 6s, 8s
                     continue
                 break
             except Exception as e:
@@ -601,18 +602,24 @@ def build_enhanced_selection_prompt_json(emails: list[dict]) -> str:
         "TASK:\n"
         f"Select the top {K} emails that most warrant attention.\n\n"
         "Ranking rules (strict):\n"
+        "0) **Category definitions (use precisely):**\n"
+        "   - **Billing/Payment:** bills, invoices, statements or messages that REQUIRE payment or explicitly ask me to PAY.\n"
+        "   - **Legal:** contracts, legal notices, penalties, court/government legal items.\n"
+        "   - **Government:** government agencies about taxes, immigration, licensing, compliance.\n"
+        "   - **Other:** everything else, including **bank transaction alerts** that do NOT ask for payment (use `txn_alert`).\n"
         "1) Action > Notification.\n"
         "2) Legal/Government/Billing/Payment first—especially deadlines or required responses.\n"
         "3) Bills/payment due always matter.\n"
         "4) Social media last; include only if nothing better exists.\n"
         "5) Avoid duplicates (same thread/topic).\n"
-        "6) **Bank/financial notifications**: treat as lower priority **unless** any of the following:\n"
+        "6) **Bank/financial notifications**: generally **Other** with `txn_alert=true` unless they demand payment.\n"
+        "   Treat them as lower priority unless any of the following:\n"
         f"   - amount ≥ {TXN_ALERT_MIN} (assume SGD if currency missing)\n"
-        "   - contains terms like: declined, failed, suspicious, unauthorized, dispute, fraud\n"
+        "   - contains: declined, failed, unauthorized, suspicious, dispute, fraud\n"
         "   - unusual merchant hints (use judgment)\n"
-        "7) Market/news/promos (e.g., Bitcoin price, coverage limits, discounts) are generally NOT transactions and should be deprioritized.\n"
-        "8) `issuer=true` is a weak prior; still deprioritize amounts without clear action/txn context.\n"
-        # >>> YOUR NEW SUB-RULES (deterministic preference within Billing/Payment) <<<
+        "7) Market/news/promos are usually non-transactional and should be deprioritized vs bills/legal. "
+        "   Among non-critical FYI items, prefer **newsletters** over **promotions**.\n"
+        "8) `issuer=true` is a hint only—use it to break ties appropriately.\n"
         "9) Within **Billing/Payment** emails:\n"
         f"   - Any transaction with amount ≥ {TXN_ALERT_MIN} must outrank any transaction < {TXN_ALERT_MIN}, "
         "unless the smaller one contains: declined, failed, unauthorized, suspicious, dispute, fraud.\n"
