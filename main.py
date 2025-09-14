@@ -332,6 +332,45 @@ def _domain_is_issuer(from_domain: str) -> bool:
     return any(d.endswith(x) for x in ISSUER_DOMAINS) if ISSUER_DOMAINS else False
 
 
+
+# =========================================================
+# OTP/2FA detection (proximity + disclaimer-aware) — mask, don't drop
+# =========================================================
+# Treat as OTP-like only when a keyword is near a code-looking token.
+# Ignore common disclaimer phrases near the keyword (e.g., "Do not share your OTPs").
+OTP_KEYWORDS_RE = re.compile(r'(?i)\\b(otp|one[- ]?time password|verification code|2fa|login code|security code)\\b')
+# Common OTP forms: 4–8 alnum, often 6 digits; avoid matching inside longer tokens.
+OTP_CODE_RE = re.compile(r'(?i)(?<![A-Z0-9])([A-Z0-9]{4,8})(?![A-Z0-9])')
+# Phrases that indicate a security disclaimer rather than a real OTP delivery.
+OTP_NEG_CUE_RE = re.compile(r'(?i)(do not share|never (?:ask|request)|we will never (?:ask|request)|stay secure|for your security|phishing|scam)')
+
+def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bool, str, str]:
+    """
+    Return (otp_like, masked_subject, masked_body).
+    - 'otp_like' True only if a keyword occurs within ±window chars of a code token,
+      and no strong negative/disclaimer cue appears near the keyword.
+    - When otp_like=True, mask candidate codes in both subject and body.
+    """
+    text = (subject or "") + "\\n" + (body or "")
+    otp_like = False
+    for m in OTP_KEYWORDS_RE.finditer(text):
+        left = max(0, m.start() - window)
+        right = min(len(text), m.end() + window)
+        window_text = text[left:right]
+        # If nearby text looks like a disclaimer, skip this occurrence
+        if OTP_NEG_CUE_RE.search(window_text):
+            continue
+        # Look for a code-like token near the keyword
+        if OTP_CODE_RE.search(window_text):
+            otp_like = True
+            break
+    if not otp_like:
+        return False, subject, body
+    # Mask plausible codes conservatively when otp_like
+    def _mask(s: str) -> str:
+        return OTP_CODE_RE.sub("‹code›", s or "")
+    return True, _mask(subject), _mask(body)
+
 def enhanced_txn_detection_v2(subject: str, body: str,
                               parsed_cur: Optional[str], parsed_amt: Optional[float],
                               from_domain: str) -> Tuple[bool, Optional[str], Optional[float], bool]:
@@ -453,11 +492,12 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
     """
     Build the full pool since the last run.
       - Include archived mail by default (STRICT_INBOX=0)
-      - Drop OTP/verification emails
+      - **Mask OTP-like codes, do NOT drop** (proximity + disclaimer-aware)
       - Keep latest per thread; keep older items only if they contain deadline words
       - Exclude past digests (subject:"AI Email Digest —")
       - Parse amounts (multi-candidate) → choose best by context → extract snippet → detect txn
     """
+
     base_q = f'after:{since_unix} -subject:"AI Email Digest —"'
     query = f'in:inbox {base_q}' if STRICT_INBOX else base_q
 
@@ -499,9 +539,10 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             full_body = _extract_full_body_text(msg)
             combined_lower = (subject + ' ' + full_body).lower()
 
-            # OTP / verification drop
-            if any(k in combined_lower for k in ['otp', 'verification code', '2fa', 'login code', 'one-time password']):
-                continue
+            # OTP / verification (mask, don't drop)
+            otp_like, subject, full_body = classify_and_mask_otp(subject, full_body)
+            if otp_like:
+                debug_print(f"[OTP] masked codes for id={m['id']} subj={subject!r}")
 
             # From domain (best-effort)
             from_domain = sender
@@ -520,7 +561,8 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             amount_span = best[2] if best else None
 
             # Snippet around the chosen amount (or action/date hints)
-            snippet = _extract_smart_snippet_v2(full_body, max_len=snippet_len, preferred_span=amount_span)
+            # (uses the possibly-masked subject/body if OTP-like)
+            snippet = _extract_snippet(subject, full_body, parsed_cur, parsed_amt, from_domain)
 
             # Txn detection (full-body, excludes 'PayNow' as trigger)
             is_txn, cur, amt, small = enhanced_txn_detection_v2(
@@ -540,6 +582,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
                 'txn_currency': cur,
                 'txn_amount': amt,
                 'txn_small': bool(small),
+                'otp_like': bool(otp_like),
             }
 
             if DEBUG and is_txn:
