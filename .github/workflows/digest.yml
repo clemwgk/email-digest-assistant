@@ -13,6 +13,8 @@ jobs:
   run-digest:
     runs-on: ubuntu-latest
     env:
+      GOOGLE_OAUTH_JSON_B64: ${{ secrets.GMAIL_CREDENTIALS_JSON_B64 }}
+      GOOGLE_TOKEN_JSON_B64: ${{ secrets.GMAIL_TOKEN_JSON_B64 }}
       DISABLE_DIGEST: ${{ secrets.DISABLE_DIGEST || '' }}
       DEBUG: ${{ secrets.DEBUG || '' }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
