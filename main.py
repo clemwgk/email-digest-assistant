@@ -619,18 +619,45 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
     html_body = "\n".join(html_parts)
     return plain_txt, html_body
 
+def _require(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing required env: {name}")
+    return v
+
+def _smtp_connect():
+    host = _require("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = _require("SMTP_USER")
+    pwd  = _require("SMTP_PASS")
+
+    if port == 465:
+        server = smtplib.SMTP_SSL(host, port, timeout=20)
+        server.login(user, pwd)
+        return server
+
+    # default: STARTTLS (587)
+    server = smtplib.SMTP(host, port, timeout=20)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    server.login(user, pwd)
+    return server
+
 def send_email(subject: str, plain: str, html_body: str):
+    from_addr = _require("MAIL_FROM")
+    to_field  = _require("MAIL_TO")
+    to_addrs = [x.strip() for x in to_field.split(",") if x.strip()]
+
     msg = MIMEMultipart('alternative')
-    msg['From'] = MAIL_FROM
-    msg['To'] = ", ".join(MAIL_TO)
+    msg['From'] = from_addr
+    msg['To'] = ", ".join(to_addrs)
     msg['Subject'] = subject
     msg.attach(MIMEText(plain, 'plain'))
     msg.attach(MIMEText(html_body, 'html'))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
+    with _smtp_connect() as server:
+        server.sendmail(from_addr, to_addrs, msg.as_string())
 
 def send_digest_email(subject: str, plain: str, html_body: str):
     send_email(subject, plain, html_body)
