@@ -1,5 +1,4 @@
-# main.py — Gmail AI Email Digest (superset query + local filter + OTP masking + number/card normalization)
-# + Restored “old style” Top cards with Subject/Snippet and Appendix table, and show actual model used.
+# main.py — Gmail AI Email Digest
 
 import os
 import time
@@ -14,6 +13,7 @@ from typing import List, Tuple, Optional, Dict
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import parseaddr
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -31,14 +31,19 @@ from openai import OpenAI
 load_dotenv()
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-OAUTH_B64 = os.getenv("GOOGLE_OAUTH_JSON_B64", "")
-TOKEN_B64 = os.getenv("GOOGLE_TOKEN_JSON_B64", "")
-ISSUER_DOMAINS = [d.strip() for d in os.getenv("ISSUER_DOMAINS", "").split(",") if d.strip()]
+
+# Accept either GOOGLE_* or GMAIL_*; else fall back to on-disk files
+OAUTH_B64 = os.getenv("GOOGLE_OAUTH_JSON_B64") or os.getenv("GMAIL_CREDENTIALS_JSON_B64") or ""
+TOKEN_B64 = os.getenv("GOOGLE_TOKEN_JSON_B64") or os.getenv("GMAIL_TOKEN_JSON_B64") or ""
+
+ISSUER_DOMAINS = [d.strip().lower() for d in os.getenv("ISSUER_DOMAINS", "").split(",") if d.strip()]
 STRICT_INBOX = os.getenv("STRICT_INBOX", "0").strip() == "1"
-DISPLAY_TZ = os.getenv("DISPLAY_TZ", "Asia/Singapore")
+DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Asia/Singapore")
+DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
 DEBUG = os.getenv("DEBUG", "0").strip() == "1"
 DISABLE_DIGEST = os.getenv("DISABLE_DIGEST", "0").strip() == "1"
 
+# SMTP config (auto-detect 465 vs 587)
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
@@ -54,28 +59,26 @@ MODEL_CANDIDATES = [
     "gpt-4o-mini",
     "gpt-3.5-turbo",
 ]
-MAX_RETRIES = 4
 BASE_BACKOFF = 2.0  # seconds
 
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Triaging tunables
-SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))            # how much context we send per email
-TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))      # mark "small" transactions below this
+# Tunables
+SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))
+TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))
 TXN_HIGH_ALERT_MIN = float(os.getenv("TXN_HIGH_ALERT_MIN", "100"))
 SINCE_BUFFER_HOURS = int(os.getenv("SINCE_BUFFER_HOURS", "6"))
 
 # -----------------------------
-# Utility
+# Utils
 # -----------------------------
 def debug_print(*args):
     if DEBUG:
         print("[DEBUG]", *args)
 
 def sg_time(ts: int) -> str:
-    tz = ZoneInfo(DISPLAY_TZ)
-    return datetime.datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M")
+    return datetime.datetime.fromtimestamp(ts, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
 
 def _extract_headers(msg) -> dict:
     headers = {}
@@ -86,30 +89,33 @@ def _extract_headers(msg) -> dict:
 def _get_header(headers: dict, name: str, default: str = "") -> str:
     return headers.get(name.lower(), default)
 
+# -----------------------------
+# Gmail auth (accept env b64 or existing files)
+# -----------------------------
 def _gmail_service():
-    # Reconstitute OAuth files from base64 blobs
     creds = None
-    if not OAUTH_B64:
-        raise RuntimeError("Missing GOOGLE_OAUTH_JSON_B64 secret")
     oauth_path = "credentials.json"
-    with open(oauth_path, "wb") as f:
-        f.write(base64.b64decode(OAUTH_B64))
-
     token_path = "token.json"
+
+    # Write files if provided via secrets
+    if OAUTH_B64:
+        with open(oauth_path, "wb") as f:
+            f.write(base64.b64decode(OAUTH_B64))
     if TOKEN_B64:
         with open(token_path, "wb") as f:
             f.write(base64.b64decode(TOKEN_B64))
 
+    if not os.path.exists(oauth_path):
+        raise RuntimeError("Missing credentials.json (provide GOOGLE_OAUTH_JSON_B64 or GMAIL_CREDENTIALS_JSON_B64).")
+
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                flow = InstalledAppFlow.from_client_secrets_file(oauth_path, SCOPES)
-                creds = flow.run_local_server(port=0)
+            creds.refresh(Request())
         else:
+            # For local/manual runs only
             flow = InstalledAppFlow.from_client_secrets_file(oauth_path, SCOPES)
             creds = flow.run_local_server(port=0)
 
@@ -121,40 +127,6 @@ def _gmail_service():
 # -----------------------------
 # HTML/text extraction + normalization
 # -----------------------------
-def _extract_full_body_text(msg) -> str:
-    def decode_part(part):
-        data = part.get('body', {}).get('data')
-        if not data:
-            return ""
-        try:
-            return base64.urlsafe_b64decode(data.encode('UTF-8')).decode('utf-8', errors='replace')
-        except Exception:
-            return ""
-    payload = msg.get('payload', {})
-    mimeType = payload.get("mimeType", "")
-    if mimeType == "text/plain":
-        return _post_process_text(decode_part(payload))
-    if mimeType == "text/html":
-        return _post_process_text(_html_to_text(decode_part(payload)))
-    if mimeType.startswith("multipart/"):
-        txt = []
-        parts = payload.get("parts", []) or []
-        for p in parts:
-            mt = p.get("mimeType", "")
-            if mt == "text/plain":
-                txt.append(decode_part(p))
-            elif mt == "text/html":
-                txt.append(_html_to_text(decode_part(p)))
-            elif mt.startswith("multipart/"):
-                for pp in p.get("parts", []) or []:
-                    mtt = pp.get("mimeType", "")
-                    if mtt == "text/plain":
-                        txt.append(decode_part(pp))
-                    elif mtt == "text/html":
-                        txt.append(_html_to_text(decode_part(pp)))
-        return _post_process_text("\n".join([t for t in txt if t]))
-    return _post_process_text("")
-
 def _html_to_text(s: str) -> str:
     s = re.sub(r'(?is)<script.*?>.*?</script>', ' ', s)
     s = re.sub(r'(?is)<style.*?>.*?</style>', ' ', s)
@@ -162,35 +134,57 @@ def _html_to_text(s: str) -> str:
     s = re.sub(r'(?is)</p>', '\n', s)
     s = re.sub(r'(?is)<.*?>', ' ', s)
     s = html.unescape(s)
+    # remove zero-width chars like &zwnj;
+    s = s.replace("\u200c", "").replace("\u200b", "")
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
 
 def _post_process_text(s: str) -> str:
-    # 1) Fix broken decimals across line breaks: "25.\n76" -> "25.76"
+    # Fix broken decimals across line breaks: "25.\n76" -> "25.76"
     s = re.sub(r'(?m)(\d+)\.\s*\n\s*(\d{2})', r'\1.\2', s)
-    # 2) Mask card last-4 so they aren't parsed as money
-    # common forms: "ending 1234", "ending in 1234", "last 4 1234", "****1234", "xxxx 1234"
+    # Mask card last-4 so they aren't parsed as money
     s = re.sub(r'(?i)\b(ending(?: in)?|last(?:\s*4|\s*four)\s*(?:digits?)?)\s*(\d{4})\b', r'\1 ‹last4›', s)
     s = re.sub(r'(?i)(?:\*{4}|x{4})[\s\-]?(\d{4})\b', r'**** ‹last4›', s)
     return s
 
-def _domain_is_issuer(from_domain: str) -> bool:
-    d = (from_domain or "").lower()
-    return any(d.endswith(x) for x in ISSUER_DOMAINS) if ISSUER_DOMAINS else False
+def _extract_full_body_text(msg) -> str:
+    def decode_data(data_b64: Optional[str]) -> str:
+        if not data_b64:
+            return ""
+        try:
+            return base64.urlsafe_b64decode(data_b64.encode('UTF-8')).decode('utf-8', errors='replace')
+        except Exception:
+            return ""
+    payload = msg.get('payload', {})
+    mimeType = payload.get("mimeType", "")
+    if mimeType == "text/plain":
+        return _post_process_text(decode_data(payload.get("body", {}).get("data")))
+    if mimeType == "text/html":
+        return _post_process_text(_html_to_text(decode_data(payload.get("body", {}).get("data"))))
+    if mimeType.startswith("multipart/"):
+        txt = []
+        parts = payload.get("parts", []) or []
+        def walk(parts):
+            for p in parts:
+                mt = p.get("mimeType", "")
+                if mt == "text/plain":
+                    txt.append(decode_data(p.get('body', {}).get('data')))
+                elif mt == "text/html":
+                    txt.append(_html_to_text(decode_data(p.get('body', {}).get('data'))))
+                elif mt.startswith("multipart/"):
+                    walk(p.get("parts", []) or [])
+        walk(parts)
+        return _post_process_text("\n".join([t for t in txt if t]))
+    return _post_process_text("")
 
-# =========================================================
-# OTP/2FA detection (proximity + disclaimer-aware) — mask, don't drop
-# =========================================================
+# -----------------------------
+# OTP/2FA detection — mask (do not drop)
+# -----------------------------
 OTP_KEYWORDS_RE = re.compile(r'(?i)\b(otp|one[- ]?time password|verification code|2fa|login code|security code)\b')
 OTP_CODE_RE = re.compile(r'(?i)(?<![A-Z0-9])([A-Z0-9]{4,8})(?![A-Z0-9])')
 OTP_NEG_CUE_RE = re.compile(r'(?i)(do not share|never (?:ask|request)|we will never (?:ask|request)|stay secure|for your security|phishing|scam)')
 
 def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bool, str, str]:
-    """
-    Return (otp_like, masked_subject, masked_body).
-    'otp_like' True only if a keyword occurs within ±window of a code and no strong disclaimer cue is nearby.
-    When otp_like=True, mask code-like tokens in both subject and body.
-    """
     text = (subject or "") + "\n" + (body or "")
     otp_like = False
     for m in OTP_KEYWORDS_RE.finditer(text):
@@ -210,15 +204,35 @@ def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bo
 
     return True, _mask(subject), _mask(body)
 
-# =========================================================
+# -----------------------------
 # Amount parsing & context
-# =========================================================
+# -----------------------------
 AMOUNT_CURR_RE = re.compile(r'(?i)\b(SGD|USD|EUR|GBP|\$)\s?([0-9]{1,3}(?:[,\s][0-9]{3})*|[0-9]+)(\.[0-9]{2})?\b')
 AMOUNT_SIMPLE_RE = re.compile(r'(?<![0-9])([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(\.[0-9]{2})\b')
-_NEAR_TXN_RE = re.compile(r'(?i)\b(transaction|charged|purchase|merchant|withdrawal|transfer|authorized|unauthorized|declined|failed)\b')
-_NEAR_NEG_RE = re.compile(r"(?i)\b(coverage|limit|credit limit|sum insured|policy|premium|price|valued at|apr|interest|markets|news|statement|advice|balance)\b")
 
-def _money_from_groups(cur: Optional[str], num: Optional[str], cents: Optional[str]) -> Optional[Tuple[str,float]]:
+# Transaction verbs and negatives
+_NEAR_TXN_RE = re.compile(r'(?i)\b(transaction|charged|purchase|merchant|withdrawal|transfer|authorized|unauthorized|declined|failed|debit|credit)\b')
+
+# **Hard** negatives (A: narrow) — coverage/insurance/limits vocabulary
+_NEAR_NEG_RE = re.compile(
+    r"(?i)\b("
+    r"coverage|cover|sum insured|insured|insurance|deposit insurance|scheme|by law|"
+    r"up to|maximum|max\.?|cap|capped|limit(?:ed)? to|per depositor|per account|"
+    r"policy|premium"
+    r")\b"
+)
+
+# **Soft** negatives (score penalty only; do NOT veto)
+_SOFT_NEG_SCORE_RE = re.compile(
+    r"(?i)\b(terms and conditions|tnc|for full terms|promotion|promo|offer|voucher|promo code|unsubscribe|manage preferences)\b"
+)
+
+# Words signaling an explicit cap/coverage window around the amount (C)
+CAP_WORDS = re.compile(
+    r"(?i)\b(up to|maximum|max\.?|cap|capped|limit(?:ed)? to|coverage|insured|insurance|deposit insurance|per depositor|per account|scheme|by law)\b"
+)
+
+def _money_from_groups(cur: Optional[str], num: Optional[str], cents: Optional[str]) -> Optional[Tuple[str, float]]:
     if num is None:
         return None
     n = num.replace(",", "").replace(" ", "")
@@ -244,16 +258,19 @@ def _parse_amounts_from_text(text: str) -> List[Tuple[str,float,Tuple[int,int]]]
             pass
     return out
 
-def _best_amount_by_context(text_lower: str, cands: list[Tuple[str,float,Tuple[int,int]]], is_issuer: bool) -> Optional[Tuple[str,float,Tuple[int,int]]]:
+def _best_amount_by_context(text: str, cands: List[Tuple[str,float,Tuple[int,int]]], is_issuer: bool) -> Optional[Tuple[str,float,Tuple[int,int]]]:
     """
     Score amounts by nearby context:
-      +3 if within ~80 chars of a txn verb
-      -3 if within ~60 chars of negative contexts
+      +3 if txn verb within ~80 chars
+      -3 if hard negative within ~60 chars (coverage/insurance/limits)
+      -1.5 if soft-negative within ~80 chars (T&C, promo, etc.)  <-- penalty only
       +1 if issuer domain
       + tiny tie-break for larger amount
     """
     if not cands:
         return None
+
+    text_lower = text.lower()
 
     def nearest_dist(regex: re.Pattern, pos: int) -> int:
         best = 10**9
@@ -269,9 +286,11 @@ def _best_amount_by_context(text_lower: str, cands: list[Tuple[str,float,Tuple[i
         center = (a + b) // 2
         d_txn = nearest_dist(_NEAR_TXN_RE, center)
         d_neg = nearest_dist(_NEAR_NEG_RE, center)
+        d_soft = nearest_dist(_SOFT_NEG_SCORE_RE, center)
         score = 0.0
         if d_txn <= 80: score += 3
         if d_neg <= 60: score -= 3
+        if d_soft <= 80: score -= 1.5
         if is_issuer: score += 1
         score += min(amt, 1000) / 100000.0
         if score > best_score:
@@ -279,8 +298,13 @@ def _best_amount_by_context(text_lower: str, cands: list[Tuple[str,float,Tuple[i
             best = (cur, amt, (a,b))
     return best
 
+def _window_has(regex: re.Pattern, text: str, span: Tuple[int,int], win: int) -> bool:
+    a, b = span
+    left = max(0, a - win); right = min(len(text), b + win)
+    return bool(regex.search(text[left:right]))
+
 # -----------------------------
-# Snippet extraction
+# Snippet extraction (amount-/action-aware)
 # -----------------------------
 SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
@@ -288,7 +312,6 @@ def _extract_window(text: str, center: int, radius: int = 220) -> str:
     a = max(0, center - radius)
     b = min(len(text), center + radius)
     seg = text[a:b]
-    # Clean up to sentence boundaries if we can
     seg = re.sub(r'\s+', ' ', seg).strip()
     return seg
 
@@ -372,28 +395,25 @@ def _get_messages_full(service, ids: List[str]) -> List[Dict]:
 
 def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
     """
-    Build the full pool since the last run.
-      - Superset Gmail query: newer_than:3d (or 7d fallback) + local internalDate filter >= since_unix
-      - Include archived mail by default (STRICT_INBOX=0); exclude spam/trash; exclude past digests
-      - Mask OTP-like codes (do NOT drop)
-      - Keep latest per thread; keep older items only if they contain deadline words
-      - Parse amounts → choose best by context → amount-centered snippet → txn detection
+    Build pool since watermark:
+      - Superset Gmail query (3d; 7d fallback) + local filter internalDate >= since_unix
+      - Include archived mail by default; exclude spam/trash; exclude past digests
+      - OTP/code masking (do not drop)
+      - Thread de-dup (keep latest; keep older w/ deadline words)
+      - Amount parsing + context → amount-centered snippet → txn flag
     """
-    strict = STRICT_INBOX
-    q3 = _build_superset_query(3, strict)
+    q3 = _build_superset_query(3, STRICT_INBOX)
     debug_print(f"gmail.superset.query(primary) = {q3}")
     raw_ids_3 = _list_message_ids(service, q3)
     debug_print(f"gmail.superset.raw_ids(primary) = {len(raw_ids_3)}")
 
-    # local filter by internalDate >= since_unix (note: Gmail internalDate is ms)
     since_ms = int(since_unix) * 1000
     mini_3 = _get_messages_minimal(service, [m["id"] for m in raw_ids_3])
     filtered = [m for m in mini_3 if int(m.get("internalDate", 0)) >= since_ms]
 
-    # Optional fallback if pool suspiciously small
     SMALL_THRESHOLD = 5
     if len(filtered) < SMALL_THRESHOLD:
-        q7 = _build_superset_query(7, strict)
+        q7 = _build_superset_query(7, STRICT_INBOX)
         debug_print(f"gmail.superset.pool_small={len(filtered)}<={SMALL_THRESHOLD} → fallback query = {q7}")
         raw_ids_7 = _list_message_ids(service, q7)
         mini_7 = _get_messages_minimal(service, [m["id"] for m in raw_ids_7])
@@ -401,16 +421,17 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         idmap.update({m["id"]: m for m in mini_7})
         filtered = [m for m in idmap.values() if int(m.get("internalDate", 0)) >= since_ms]
 
-    # newest first
     filtered.sort(key=lambda m: int(m.get("internalDate", 0)), reverse=True)
     full_msgs = _get_messages_full(service, [m["id"] for m in filtered])
     debug_print(f"gmail.superset.final_pool_size (pre-OTP/thread-dedup) = {len(full_msgs)}; since_unix={since_unix}")
 
-    # Convert to items with OTP masking, parsing, etc.
     items = []
     for msg in full_msgs:
         headers = _extract_headers(msg)
-        sender = _get_header(headers, "from")
+        sender_hdr = _get_header(headers, "from")
+        display_name, addr = parseaddr(sender_hdr)
+        friendly_from = sender_hdr if display_name else (display_name or addr)
+
         subject = _get_header(headers, "subject")
         try:
             ts = int(msg.get('internalDate', '0')) // 1000
@@ -420,40 +441,35 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 
         full_body = _extract_full_body_text(msg)
 
-        # OTP / verification (mask, don't drop)
+        # OTP masking
         otp_like, subject, full_body = classify_and_mask_otp(subject, full_body)
         if otp_like:
             debug_print(f"[OTP] masked codes for id={msg.get('id')} subj={subject!r}")
 
-        # From domain (best-effort)
-        from_domain = sender
-        if '@' in sender:
-            try:
-                from_domain = sender.split('@')[-1].split('>')[0].strip().lower()
-            except Exception:
-                pass
-        is_issuer = _domain_is_issuer(from_domain)
+        # From domain
+        from_domain = (addr.split('@')[-1].lower() if addr else (sender_hdr or "").lower()).strip()
+        is_issuer = any(from_domain.endswith(x) for x in ISSUER_DOMAINS)
 
-        # Amount parsing + context
+        # Amounts + best by context (A soft negatives included)
         cands = _parse_amounts_from_text(full_body)
-        best = _best_amount_by_context(full_body.lower(), cands, is_issuer)
+        best = _best_amount_by_context(full_body, cands, is_issuer)
         parsed_cur = best[0] if best else None
         parsed_amt = best[1] if best else None
         amount_span = best[2] if best else None
 
-        # Txn detection
+        # --- Refined is_txn logic ---
         is_txn = False
-        if parsed_amt is not None:
-            if _NEAR_TXN_RE.search(full_body):
-                is_txn = True
-            if _NEAR_NEG_RE.search(full_body):
-                is_txn = False
+        if best:
+            # (B) require txn verb near amount; (hard negatives near amount veto)
+            center_near_txn = _window_has(_NEAR_TXN_RE, full_body, amount_span, win=120)
+            center_near_neg  = _window_has(_NEAR_NEG_RE, full_body, amount_span, win=80)
+            # (C) cap/coverage window veto
+            cap_near = _window_has(CAP_WORDS, full_body, amount_span, win=60)
+            is_txn = bool(center_near_txn and not center_near_neg and not cap_near)
 
-        cur = parsed_cur
-        amt = parsed_amt
         small = None
-        if cur and amt is not None:
-            small = (cur == "SGD" and amt < TXN_ALERT_MIN)
+        if parsed_cur and parsed_amt is not None:
+            small = (parsed_cur == "SGD" and parsed_amt < TXN_ALERT_MIN)
 
         snippet = _extract_smart_snippet_v2(f"{subject}\n{full_body}", snippet_len, amount_span)
 
@@ -462,19 +478,20 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             'threadId': thread_id,
             'timestamp': ts,
             'from_domain': from_domain,
-            'from_raw': sender,
+            'from_raw': sender_hdr,            # "Name <email>"
+            'from_friendly': friendly_from,    # guaranteed readable
             'subject': subject,
             'snippet': snippet,
-            'has_deadline_word': bool(re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', (subject + ' ' + full_body).lower())),
-            'txn_alert': is_txn,
-            'txn_currency': cur,
-            'txn_amount': amt,
+            'has_deadline_word': bool(re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', (subject + ' ' + full_body))),
+            'txn_alert': bool(is_txn),
+            'txn_currency': parsed_cur,
+            'txn_amount': parsed_amt,
             'txn_small': bool(small),
             'otp_like': bool(otp_like),
         }
         items.append(item)
 
-    # Thread de-dup: keep latest per thread; include older only if they contain deadline words
+    # Thread de-dup (keep latest; keep older with deadline words)
     items.sort(key=lambda x: x['timestamp'], reverse=True)
     by_thread = {}
     for it in items:
@@ -507,10 +524,6 @@ RANK_USER_TMPL = """You are given a list of emails with fields:
 id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word.
 Choose Top-5 strictly from these IDs. Prefer actionability and legal/gov/billing.
 """
-
-def choose_model():
-    # Keep simple; fallback handled in llm_rank
-    return MODEL_CANDIDATES[0]
 
 def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     if not items:
@@ -575,109 +588,154 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     return [], MODEL_CANDIDATES[min(model_idx, len(MODEL_CANDIDATES)-1)]
 
 # -----------------------------
-# Email rendering & sending
+# Rendering — "old look"
 # -----------------------------
-def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int, used_model: str) -> Tuple[str,str]:
-    tz = ZoneInfo(DISPLAY_TZ)
-    ws = datetime.datetime.fromtimestamp(window_start, tz=tz).strftime("%Y-%m-%d %H:%M")
-    we = datetime.datetime.fromtimestamp(window_end, tz=tz).strftime("%Y-%m-%d %H:%M")
+def _badge(label: str, bg: str, color: str = "#111"):
+    return f"<span style='display:inline-block;padding:2px 8px;border-radius:12px;background:{bg};color:{color};font-size:12px;font-weight:600'>{html.escape(label)}</span>"
 
-    # map for quick lookup by id
+def _titlecase_or(raw: Optional[str], fallback: str) -> str:
+    s = (raw or "").strip()
+    return s[:1].upper() + s[1:] if s else fallback
+
+def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int, used_model: str) -> Tuple[str,str]:
+    ws = datetime.datetime.fromtimestamp(window_start, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    we = datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+
     by_id = {it["id"]: it for it in items}
 
-    title = f"Gmail - AI Email Digest — {ws.split(' ')[0]} (model: {used_model}; considered {considered_count})"
-
-    # ---------- PLAIN TEXT ----------
+    # Plain text
     plain_lines = [
-        f"Window: {ws} → {we}",
-        f"Considered: {considered_count}",
+        f"# AI Email Digest ({datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})",
+        f"Model: {used_model}",
+        f"Considered: {considered_count} emails · Window: {ws} → {we}",
         "",
-        "Top:",
+        f"# Today's Top {len(top)} Emails",
     ]
     if not top:
-        plain_lines.append("(none)")
+        plain_lines.append("_No eligible emails._")
     else:
         for i, row in enumerate(top, 1):
             it = by_id.get(row["id"], {})
             subj = it.get("subject", "(no subject)")
-            snippet = (it.get("snippet") or "").strip()
-            cat = row.get("category")
-            urg = row.get("urgency")
-            why = row.get("why")
-            act = row.get("action")
-            plain_lines.append(f"{i}. {subj}")
-            if cat or urg:
-                plain_lines.append(f"   [{cat or 'other'} | {urg or 'n/a'}]")
-            if why: plain_lines.append(f"   Why: {why}")
-            if act: plain_lines.append(f"   Action: {act}")
-            if snippet: plain_lines.append(f"   Snippet: {snippet}")
+            frm = it.get("from_raw") or it.get("from_friendly") or it.get("from_domain")
+            why = row.get("why") or ""
+            act = row.get("action") or ""
+            urg = row.get("urgency") or "Low"
+            cat = row.get("category") or "Other"
+            snip = (it.get("snippet") or "").strip()
+            plain_lines.append(f"{i}. {subj} — {frm}")
+            plain_lines.append(f"   - Category: {cat} | Urgency: {urg}")
+            if why: plain_lines.append(f"   - Why: {why}")
+            if act: plain_lines.append(f"   - Action: {act}")
+            if snip: plain_lines.append(f"   - Snippet: {snip}")
             plain_lines.append("")
-    plain_lines.append("Appendix:")
+    # Appendix (plain)
+    plain_lines.append(f"\n---\n## Appendix — All considered ({len(items)})")
     for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
-        plain_lines.append(f"- {sg_time(it['timestamp'])} — {it['from_raw']} — {it['subject']}")
+        plain_lines.append(f"- [{sg_time(it['timestamp'])}] {it.get('from_raw','?')} — {it.get('subject','(no subject)')}")
     plain_txt = "\n".join(plain_lines)
 
-    def esc(s): return html.escape(s or "")
-    # ---------- HTML ----------
-    html_parts = [
-        f"<h2>{esc(title)}</h2>",
-        f"<p><b>Window:</b> {esc(ws)} → {esc(we)} &nbsp; | &nbsp; <b>Considered:</b> {considered_count}</p>",
-        "<h3>Top</h3>",
-    ]
+    # HTML
+    title = f"AI Email Digest ({datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})"
+    header_html = (
+        f"<h2 style='margin:0 0 4px 0;font-size:20px'>{html.escape(title)}</h2>"
+        f"<div style='color:#6b7280;font-size:12px;margin-bottom:12px'>"
+        f"Model: <strong>{html.escape(used_model)}</strong> · "
+        f"Considered: <strong>{considered_count}</strong> emails · "
+        f"Window: {html.escape(ws)} → {html.escape(we)}</div>"
+    )
+
+    items_html = []
     if not top:
-        html_parts.append("<p>(none)</p>")
+        items_html.append("<p><em>No eligible emails.</em></p>")
     else:
         for i, row in enumerate(top, 1):
             it = by_id.get(row["id"], {})
-            subj = esc(it.get("subject", "(no subject)"))
-            from_d = esc(it.get("from_domain", "") or it.get("from_raw", ""))
-            snippet = esc((it.get("snippet") or "").strip())
-            cat = esc(row.get("category") or "other")
-            urg = esc(row.get("urgency") or "n/a")
-            why = esc(row.get("why") or "")
-            act = esc(row.get("action") or "")
-            html_parts.append(
-                f"""
-                <div style="border:1px solid #e7e7e7;border-radius:12px;padding:12px;margin:12px 0;">
-                  <div style="font-weight:600;margin-bottom:4px;">{i}. {subj}</div>
-                  <div style="color:#666;margin-bottom:8px;">{from_d}</div>
-                  <div style="margin:6px 0 10px 0;">
-                    <span style="display:inline-block;background:#eef;border:1px solid #dde;border-radius:999px;padding:2px 8px;margin-right:6px;">{cat}</span>
-                    <span style="display:inline-block;background:#efe;border:1px solid #ded;border-radius:999px;padding:2px 8px;">Urgency: {urg}</span>
-                  </div>
-                  {"<div><b>Why:</b> " + why + "</div>" if why else ""}
-                  {"<div><b>Action:</b> " + act + "</div>" if act else ""}
-                  {"<div><b>Snippet:</b> " + snippet + "</div>" if snippet else ""}
+            subj = html.escape(it.get("subject", "(no subject)"))
+            frm = html.escape(it.get("from_raw") or it.get("from_friendly") or it.get("from_domain") or "")
+            dom = html.escape(it.get("from_domain", "") or "")
+            domain_link = f"<a href='https://{dom}' style='color:#2563eb;text-decoration:none'>{dom}</a>" if dom else ""
+            snip = html.escape((it.get("snippet") or "").strip())
+            why = html.escape(row.get("why") or "")
+            act = html.escape(row.get("action") or "")
+            # Normalize badge labels closer to old look
+            cat = _titlecase_or(row.get("category"), "Other")
+            urg = _titlecase_or(row.get("urgency"), "Low")
+            typ = _titlecase_or(row.get("type"), "For Information Only")
+            # badge colors (soft)
+            type_bg = "#dbeafe" if typ == "For Information Only" else "#fde68a"
+            cat_bg_map = {"Legal": "#fecaca", "Government": "#fde68a", "Billing" : "#bbf7d0", "Billing/payment": "#bbf7d0", "Other": "#e5e7eb", "Transaction": "#bbf7d0", "Security": "#e9d5ff"}
+            cat_bg = cat_bg_map.get(cat, "#e5e7eb")
+            urg_bg_map = {"High": "#fecaca", "Medium": "#fde68a", "Low": "#d1fae5"}
+            urg_bg = urg_bg_map.get(urg, "#e5e7eb")
+
+            txn_chip = ""
+            if it.get("txn_alert"):
+                amt = it.get("txn_amount")
+                cur = it.get("txn_currency") or "SGD"
+                if isinstance(amt, (int, float)):
+                    big = amt >= TXN_HIGH_ALERT_MIN
+                    txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#bbf7d0" if big else "#e5e7eb")
+                else:
+                    txn_chip = _badge("Txn alert", "#e5e7eb")
+
+            items_html.append(f"""
+              <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:10px 0;background:#ffffff">
+                <div style="font-weight:700;font-size:15px;line-height:1.3;margin-bottom:4px">{i}. {subj}</div>
+                <div style="color:#6b7280;font-size:13px;margin-bottom:4px">{domain_link}</div>
+                <div style="color:#6b7280;font-size:13px;margin-bottom:8px">{frm}</div>
+                <div style="margin-bottom:8px">
+                  {_badge(typ, type_bg)}
+                  <span style="display:inline-block;width:6px"></span>
+                  {_badge(cat, cat_bg)}
+                  <span style="display:inline-block;width:6px"></span>
+                  {_badge(f"Urgency: {urg}", urg_bg)}
+                  {'<span style="display:inline-block;width:6px"></span>' + txn_chip if txn_chip else ''}
                 </div>
-                """
-            )
+                {('<div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> ' + why + '</div>') if why else ''}
+                {('<div style="font-size:13px;margin-bottom:6px"><strong>Action:</strong> ' + act + '</div>') if act else ''}
+                {('<div style="font-size:12px;color:#6b7280"><strong>Snippet:</strong> ' + snip + '</div>') if snip else ''}
+              </div>
+            """)
 
-    # Appendix table
-    html_parts.append("<h3>Appendix — All considered</h3>")
-    html_parts.append("""
-    <table style="border-collapse:collapse;width:100%;font-size:14px;">
-      <thead>
-        <tr>
-          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">Time</th>
-          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">From</th>
-          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">Subject</th>
-        </tr>
-      </thead>
-      <tbody>
-    """)
+    appendix_rows = []
     for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
-        html_parts.append(
-            f"<tr>"
-            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(sg_time(it['timestamp']))}</td>"
-            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(it['from_raw'])}</td>"
-            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(it['subject'])}</td>"
-            f"</tr>"
+        t = html.escape(sg_time(it["timestamp"]))
+        f = html.escape(it.get("from_raw") or it.get("from_friendly") or "?")
+        s = html.escape(it.get("subject") or "(no subject)")
+        appendix_rows.append(
+            "<tr>"
+            f"<td style='padding:6px 8px;color:#6b7280;font-size:12px;border-bottom:1px solid #f0f0f0'>{t}</td>"
+            f"<td style='padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0'>{f}</td>"
+            f"<td style='padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0'>{s}</td>"
+            "</tr>"
         )
-    html_parts.append("</tbody></table>")
+    appendix_html = (
+        "<div style='margin-top:14px'>"
+        f"<h3 style='margin:0 0 6px 0;font-size:14px'>Appendix — All considered ({len(items)})</h3>"
+        "<table style='border-collapse:collapse;width:100%;margin-top:8px'>"
+        "<thead><tr>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>Time</th>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>From</th>"
+        "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>Subject</th>"
+        "</tr></thead><tbody>"
+        + "".join(appendix_rows) +
+        "</tbody></table></div>"
+    )
 
-    html_body = "\n".join(html_parts)
+    html_body = (
+        "<html><body>"
+        "<div style='font-family:Inter,Segoe UI,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px 12px;background:#f8fafc'>"
+        + header_html + "".join(items_html) + appendix_html +
+        "<div style='color:#9ca3af;font-size:11px;margin-top:12px'>— Generated by your Email Digest Assistant</div>"
+        "</div></body></html>"
+    )
+
     return plain_txt, html_body
 
+# -----------------------------
+# Email sending (587 STARTTLS or 465 SSL)
+# -----------------------------
 def _require(name: str) -> str:
     v = os.getenv(name)
     if not v:
@@ -695,8 +753,7 @@ def _smtp_connect():
         server.login(user, pwd)
         return server
 
-    # default: STARTTLS (587)
-    server = smtplib.SMTP(host, port, timeout=20)
+    server = smtplib.SMTP(host, port, timeout=20)  # STARTTLS
     server.ehlo()
     server.starttls()
     server.ehlo()
@@ -742,7 +799,7 @@ def _write_last_sent_timestamp(ts: int):
         f.write(str(ts))
 
 # -----------------------------
-# Main flow
+# Main
 # -----------------------------
 def main():
     if DISABLE_DIGEST:
@@ -754,14 +811,10 @@ def main():
 
         now = int(time.time())
         last_sent = _read_last_sent_timestamp() or (now - 86400)
-        # watermark with buffer
-        since_unix = last_sent - SINCE_BUFFER_HOURS * 3600
-        if since_unix < 0:
-            since_unix = 0
+        since_unix = max(0, last_sent - SINCE_BUFFER_HOURS * 3600)
 
-        tz = ZoneInfo(DISPLAY_TZ)
         print("UTC now:", datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%d %H:%M"))
-        print(f"Window (display {DISPLAY_TZ}): {sg_time(since_unix)} → {sg_time(now)}")
+        print(f"Window (display {DISPLAY_TZ_NAME}): {sg_time(since_unix)} → {sg_time(now)}")
 
         items = fetch_all_since_v2(service, since_unix, snippet_len=SNIPPET_LEN)
         considered_count = len(items)
@@ -769,7 +822,7 @@ def main():
         top, used_model = llm_rank(items)
 
         plain, html_body = render_digest(items, top, since_unix, now, considered_count, used_model)
-        subject = f"Gmail - AI Email Digest — {datetime.datetime.fromtimestamp(now, tz=tz).strftime('%Y-%m-%d')} (model: {used_model}; considered {considered_count})"
+        subject = f"AI Email Digest ({datetime.datetime.fromtimestamp(now, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})"
 
         send_digest_email(subject, plain, html_body)
         print("Digest sent.")
