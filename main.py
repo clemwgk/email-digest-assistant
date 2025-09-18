@@ -1,4 +1,5 @@
 # main.py — Gmail AI Email Digest (superset query + local filter + OTP masking + number/card normalization)
+# + Restored “old style” Top cards with Subject/Snippet and Appendix table, and show actual model used.
 
 import os
 import time
@@ -511,9 +512,9 @@ def choose_model():
     # Keep simple; fallback handled in llm_rank
     return MODEL_CANDIDATES[0]
 
-def llm_rank(items: List[dict]) -> List[dict]:
+def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     if not items:
-        return []
+        return [], MODEL_CANDIDATES[0]
 
     model_idx = 0
     backoff = BASE_BACKOFF
@@ -562,7 +563,7 @@ def llm_rank(items: List[dict]) -> List[dict]:
                     })
                 if len(out) >= 5:
                     break
-            return out
+            return out, model
         except Exception as e:
             last_err = e
             debug_print(f"[Rank:{model}] error: {e}")
@@ -571,50 +572,108 @@ def llm_rank(items: List[dict]) -> List[dict]:
             backoff *= 2.0
 
     debug_print(f"[Rank] total failure: {last_err}")
-    return []
+    return [], MODEL_CANDIDATES[min(model_idx, len(MODEL_CANDIDATES)-1)]
 
 # -----------------------------
 # Email rendering & sending
 # -----------------------------
-def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int) -> Tuple[str,str]:
+def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int, used_model: str) -> Tuple[str,str]:
     tz = ZoneInfo(DISPLAY_TZ)
     ws = datetime.datetime.fromtimestamp(window_start, tz=tz).strftime("%Y-%m-%d %H:%M")
     we = datetime.datetime.fromtimestamp(window_end, tz=tz).strftime("%Y-%m-%d %H:%M")
 
-    appendix_rows = [f"{sg_time(it['timestamp'])} — {it['from_raw']} — {it['subject']}" for it in items]
-    appendix = "\n".join(appendix_rows)
+    # map for quick lookup by id
+    by_id = {it["id"]: it for it in items}
 
-    title = f"Gmail - AI Email Digest — {ws.split(' ')[0]} (model: {MODEL_CANDIDATES[0]}; considered {considered_count})"
+    title = f"Gmail - AI Email Digest — {ws.split(' ')[0]} (model: {used_model}; considered {considered_count})"
 
-    plain = []
-    plain.append(f"Window: {ws} → {we}")
-    plain.append(f"Considered: {considered_count}")
-    plain.append("")
-    if top:
-        plain.append("Top:")
-        for i, row in enumerate(top, 1):
-            plain.append(f"{i}. [{row.get('category')}] {row.get('why')} — {row.get('action')}")
+    # ---------- PLAIN TEXT ----------
+    plain_lines = [
+        f"Window: {ws} → {we}",
+        f"Considered: {considered_count}",
+        "",
+        "Top:",
+    ]
+    if not top:
+        plain_lines.append("(none)")
     else:
-        plain.append("(No Top items)")
-    plain.append("\nAppendix:")
-    plain.append(appendix)
-    plain_txt = "\n".join(plain)
+        for i, row in enumerate(top, 1):
+            it = by_id.get(row["id"], {})
+            subj = it.get("subject", "(no subject)")
+            snippet = (it.get("snippet") or "").strip()
+            cat = row.get("category")
+            urg = row.get("urgency")
+            why = row.get("why")
+            act = row.get("action")
+            plain_lines.append(f"{i}. {subj}")
+            if cat or urg:
+                plain_lines.append(f"   [{cat or 'other'} | {urg or 'n/a'}]")
+            if why: plain_lines.append(f"   Why: {why}")
+            if act: plain_lines.append(f"   Action: {act}")
+            if snippet: plain_lines.append(f"   Snippet: {snippet}")
+            plain_lines.append("")
+    plain_lines.append("Appendix:")
+    for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
+        plain_lines.append(f"- {sg_time(it['timestamp'])} — {it['from_raw']} — {it['subject']}")
+    plain_txt = "\n".join(plain_lines)
 
     def esc(s): return html.escape(s or "")
+    # ---------- HTML ----------
     html_parts = [
         f"<h2>{esc(title)}</h2>",
-        f"<p><b>Window:</b> {esc(ws)} → {esc(we)}<br><b>Considered:</b> {considered_count}</p>",
+        f"<p><b>Window:</b> {esc(ws)} → {esc(we)} &nbsp; | &nbsp; <b>Considered:</b> {considered_count}</p>",
         "<h3>Top</h3>",
-        "<ol>",
     ]
-    for row in top:
-        html_parts.append(f"<li><b>{esc(row.get('category'))}</b> — {esc(row.get('why'))} — <i>{esc(row.get('action'))}</i></li>")
     if not top:
-        html_parts.append("<li>(none)</li>")
-    html_parts.append("</ol><h3>Appendix</h3><ul>")
-    for it in items:
-        html_parts.append(f"<li>{esc(sg_time(it['timestamp']))} — {esc(it['from_raw'])} — {esc(it['subject'])}</li>")
-    html_parts.append("</ul>")
+        html_parts.append("<p>(none)</p>")
+    else:
+        for i, row in enumerate(top, 1):
+            it = by_id.get(row["id"], {})
+            subj = esc(it.get("subject", "(no subject)"))
+            from_d = esc(it.get("from_domain", "") or it.get("from_raw", ""))
+            snippet = esc((it.get("snippet") or "").strip())
+            cat = esc(row.get("category") or "other")
+            urg = esc(row.get("urgency") or "n/a")
+            why = esc(row.get("why") or "")
+            act = esc(row.get("action") or "")
+            html_parts.append(
+                f"""
+                <div style="border:1px solid #e7e7e7;border-radius:12px;padding:12px;margin:12px 0;">
+                  <div style="font-weight:600;margin-bottom:4px;">{i}. {subj}</div>
+                  <div style="color:#666;margin-bottom:8px;">{from_d}</div>
+                  <div style="margin:6px 0 10px 0;">
+                    <span style="display:inline-block;background:#eef;border:1px solid #dde;border-radius:999px;padding:2px 8px;margin-right:6px;">{cat}</span>
+                    <span style="display:inline-block;background:#efe;border:1px solid #ded;border-radius:999px;padding:2px 8px;">Urgency: {urg}</span>
+                  </div>
+                  {"<div><b>Why:</b> " + why + "</div>" if why else ""}
+                  {"<div><b>Action:</b> " + act + "</div>" if act else ""}
+                  {"<div><b>Snippet:</b> " + snippet + "</div>" if snippet else ""}
+                </div>
+                """
+            )
+
+    # Appendix table
+    html_parts.append("<h3>Appendix — All considered</h3>")
+    html_parts.append("""
+    <table style="border-collapse:collapse;width:100%;font-size:14px;">
+      <thead>
+        <tr>
+          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">Time</th>
+          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">From</th>
+          <th align="left" style="border-bottom:1px solid #ddd;padding:8px;">Subject</th>
+        </tr>
+      </thead>
+      <tbody>
+    """)
+    for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
+        html_parts.append(
+            f"<tr>"
+            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(sg_time(it['timestamp']))}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(it['from_raw'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #f0f0f0;'>{esc(it['subject'])}</td>"
+            f"</tr>"
+        )
+    html_parts.append("</tbody></table>")
 
     html_body = "\n".join(html_parts)
     return plain_txt, html_body
@@ -707,10 +766,10 @@ def main():
         items = fetch_all_since_v2(service, since_unix, snippet_len=SNIPPET_LEN)
         considered_count = len(items)
 
-        top = llm_rank(items)
+        top, used_model = llm_rank(items)
 
-        plain, html_body = render_digest(items, top, since_unix, now, considered_count)
-        subject = f"Gmail - AI Email Digest — {datetime.datetime.fromtimestamp(now, tz=tz).strftime('%Y-%m-%d')} (model: {MODEL_CANDIDATES[0]}; considered {considered_count})"
+        plain, html_body = render_digest(items, top, since_unix, now, considered_count, used_model)
+        subject = f"Gmail - AI Email Digest — {datetime.datetime.fromtimestamp(now, tz=tz).strftime('%Y-%m-%d')} (model: {used_model}; considered {considered_count})"
 
         send_digest_email(subject, plain, html_body)
         print("Digest sent.")
@@ -719,6 +778,7 @@ def main():
     except Exception as e:
         send_error_email("Email Digest ERROR", f"{e}\n\n{traceback.format_exc()}")
         print("Digest failed:", e)
+        raise  # fail the workflow visibly
 
 if __name__ == "__main__":
     main()
