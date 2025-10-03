@@ -351,8 +351,17 @@ def _with_retries(fn, what: str, tries: int = 5, base_sleep: float = 0.6):
     raise last
 
 def _build_superset_query(days: int, strict_inbox: bool) -> str:
-    scope = "in:inbox" if strict_inbox else "in:anywhere"
-    return f'newer_than:{days}d {scope} -in:spam -in:trash -subject:"AI Email Digest —"'
+-    scope = "in:inbox" if strict_inbox else "in:anywhere"
+-    return f'newer_than:{days}d {scope} -in:spam -in:trash -subject:"AI Email Digest —"'
++    scope = "in:inbox" if strict_inbox else "in:anywhere"
++    # Exclude our own outbound mail so digests don’t list emails we sent
++    # (still includes replies in the same thread because those are not labeled Sent)
++    return (
++        f'newer_than:{days}d {scope} '
++        f'-in:spam -in:trash -in:sent -from:me '
++        f'-subject:"AI Email Digest —"'
++    )
+
 
 def _list_message_ids(service, q: str, max_pages: int = 50, page_size: int = 500) -> List[Dict[str,str]]:
     user_id = "me"
