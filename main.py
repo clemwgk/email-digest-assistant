@@ -1,4 +1,4 @@
-# main.py — Gmail AI Email Digest
+# main.py — Gmail AI Email Digest (reliability + "old look" UI + ranking fixes A & B)
 
 import os
 import time
@@ -205,15 +205,15 @@ def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bo
     return True, _mask(subject), _mask(body)
 
 # -----------------------------
-# Amount parsing & context
+# Amount parsing & context (with earlier refined heuristics)
 # -----------------------------
 AMOUNT_CURR_RE = re.compile(r'(?i)\b(SGD|USD|EUR|GBP|\$)\s?([0-9]{1,3}(?:[,\s][0-9]{3})*|[0-9]+)(\.[0-9]{2})?\b')
 AMOUNT_SIMPLE_RE = re.compile(r'(?<![0-9])([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(\.[0-9]{2})\b')
 
-# Transaction verbs and negatives
-_NEAR_TXN_RE = re.compile(r'(?i)\b(transaction|charged|purchase|merchant|withdrawal|transfer|authorized|unauthorized|declined|failed|debit|credit)\b')
+_NEAR_TXN_RE = re.compile(r'(?i)\b(transaction alert|charged|debited|purchase(?:d)?|withdrawal|transfer(?:red)?|authorized|unauthorized|declined|failed|credited|you(?:’|\'|)ve received|you received)\b')
+# Note: we intentionally removed bare /\btransaction\b/ as an alert trigger.
 
-# **Hard** negatives (A: narrow) — coverage/insurance/limits vocabulary
+# Hard negatives near amount (coverage/insurance/limits)
 _NEAR_NEG_RE = re.compile(
     r"(?i)\b("
     r"coverage|cover|sum insured|insured|insurance|deposit insurance|scheme|by law|"
@@ -222,12 +222,11 @@ _NEAR_NEG_RE = re.compile(
     r")\b"
 )
 
-# **Soft** negatives (score penalty only; do NOT veto)
+# Soft negatives: promo/T&C — used in scoring only elsewhere (left intact here)
 _SOFT_NEG_SCORE_RE = re.compile(
     r"(?i)\b(terms and conditions|tnc|for full terms|promotion|promo|offer|voucher|promo code|unsubscribe|manage preferences)\b"
 )
 
-# Words signaling an explicit cap/coverage window around the amount (C)
 CAP_WORDS = re.compile(
     r"(?i)\b(up to|maximum|max\.?|cap|capped|limit(?:ed)? to|coverage|insured|insurance|deposit insurance|per depositor|per account|scheme|by law)\b"
 )
@@ -258,12 +257,17 @@ def _parse_amounts_from_text(text: str) -> List[Tuple[str,float,Tuple[int,int]]]
             pass
     return out
 
+def _window_has(regex: re.Pattern, text: str, span: Tuple[int,int], win: int) -> bool:
+    a, b = span
+    left = max(0, a - win); right = min(len(text), b + win)
+    return bool(regex.search(text[left:right]))
+
 def _best_amount_by_context(text: str, cands: List[Tuple[str,float,Tuple[int,int]]], is_issuer: bool) -> Optional[Tuple[str,float,Tuple[int,int]]]:
     """
     Score amounts by nearby context:
       +3 if txn verb within ~80 chars
       -3 if hard negative within ~60 chars (coverage/insurance/limits)
-      -1.5 if soft-negative within ~80 chars (T&C, promo, etc.)  <-- penalty only
+      -1.5 if soft-negative within ~80 chars (T&C, promo, etc.)
       +1 if issuer domain
       + tiny tie-break for larger amount
     """
@@ -298,11 +302,6 @@ def _best_amount_by_context(text: str, cands: List[Tuple[str,float,Tuple[int,int
             best = (cur, amt, (a,b))
     return best
 
-def _window_has(regex: re.Pattern, text: str, span: Tuple[int,int], win: int) -> bool:
-    a, b = span
-    left = max(0, a - win); right = min(len(text), b + win)
-    return bool(regex.search(text[left:right]))
-
 # -----------------------------
 # Snippet extraction (amount-/action-aware)
 # -----------------------------
@@ -336,6 +335,23 @@ def _extract_smart_snippet_v2(full_text: str, max_len: int, preferred_span: Opti
     return re.sub(r'\s+', ' ', full_text)[:max_len]
 
 # -----------------------------
+# Promo tagging for ranking fixes (A)
+# -----------------------------
+PROMO_NEAR_AMOUNT = re.compile(
+    r"(?i)\b(spend (?:a )?minimum|stand a chance to win|giveaway|voucher|flash deal|rebate|bonus miles|rsvp|t&cs apply|terms and conditions apply)\b"
+)
+
+def looks_adv(subject: str) -> bool:
+    return (subject or "").strip().upper().startswith("<ADV>")
+
+def promo_like_near_amount(text: str, span: Optional[Tuple[int,int]], win: int = 120) -> bool:
+    if not span:
+        return False
+    a, b = span
+    left = max(0, a - win); right = min(len(text), b + win)
+    return bool(PROMO_NEAR_AMOUNT.search(text[left:right]))
+
+# -----------------------------
 # Gmail superset fetch + local filter
 # -----------------------------
 def _with_retries(fn, what: str, tries: int = 5, base_sleep: float = 0.6):
@@ -351,17 +367,13 @@ def _with_retries(fn, what: str, tries: int = 5, base_sleep: float = 0.6):
     raise last
 
 def _build_superset_query(days: int, strict_inbox: bool) -> str:
--    scope = "in:inbox" if strict_inbox else "in:anywhere"
--    return f'newer_than:{days}d {scope} -in:spam -in:trash -subject:"AI Email Digest —"'
-+    scope = "in:inbox" if strict_inbox else "in:anywhere"
-+    # Exclude our own outbound mail so digests don’t list emails we sent
-+    # (still includes replies in the same thread because those are not labeled Sent)
-+    return (
-+        f'newer_than:{days}d {scope} '
-+        f'-in:spam -in:trash -in:sent -from:me '
-+        f'-subject:"AI Email Digest —"'
-+    )
-
+    scope = "in:inbox" if strict_inbox else "in:anywhere"
+    # Exclude our own sent mail
+    return (
+        f'newer_than:{days}d {scope} '
+        f'-in:spam -in:trash -in:sent -from:me '
+        f'-subject:"AI Email Digest —"'
+    )
 
 def _list_message_ids(service, q: str, max_pages: int = 50, page_size: int = 500) -> List[Dict[str,str]]:
     user_id = "me"
@@ -406,10 +418,11 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
     """
     Build pool since watermark:
       - Superset Gmail query (3d; 7d fallback) + local filter internalDate >= since_unix
-      - Include archived mail by default; exclude spam/trash; exclude past digests
+      - Include archived mail by default; exclude spam/trash; exclude past digests; exclude Sent/from:me
       - OTP/code masking (do not drop)
       - Thread de-dup (keep latest; keep older w/ deadline words)
       - Amount parsing + context → amount-centered snippet → txn flag
+      - Tagging for ranking fixes: is_adv, promo_like
     """
     q3 = _build_superset_query(3, STRICT_INBOX)
     debug_print(f"gmail.superset.query(primary) = {q3}")
@@ -459,22 +472,24 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         from_domain = (addr.split('@')[-1].lower() if addr else (sender_hdr or "").lower()).strip()
         is_issuer = any(from_domain.endswith(x) for x in ISSUER_DOMAINS)
 
-        # Amounts + best by context (A soft negatives included)
+        # Amounts + best by context
         cands = _parse_amounts_from_text(full_body)
         best = _best_amount_by_context(full_body, cands, is_issuer)
         parsed_cur = best[0] if best else None
         parsed_amt = best[1] if best else None
         amount_span = best[2] if best else None
 
-        # --- Refined is_txn logic ---
+        # Refined is_txn logic (already in place)
         is_txn = False
         if best:
-            # (B) require txn verb near amount; (hard negatives near amount veto)
             center_near_txn = _window_has(_NEAR_TXN_RE, full_body, amount_span, win=120)
             center_near_neg  = _window_has(_NEAR_NEG_RE, full_body, amount_span, win=80)
-            # (C) cap/coverage window veto
             cap_near = _window_has(CAP_WORDS, full_body, amount_span, win=60)
             is_txn = bool(center_near_txn and not center_near_neg and not cap_near)
+
+        # Tag for ranking fixes (A)
+        is_adv = looks_adv(subject)
+        promo_near = promo_like_near_amount(full_body, amount_span)
 
         small = None
         if parsed_cur and parsed_amt is not None:
@@ -488,7 +503,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             'timestamp': ts,
             'from_domain': from_domain,
             'from_raw': sender_hdr,            # "Name <email>"
-            'from_friendly': friendly_from,    # guaranteed readable
+            'from_friendly': friendly_from,    # readable
             'subject': subject,
             'snippet': snippet,
             'has_deadline_word': bool(re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', (subject + ' ' + full_body))),
@@ -497,6 +512,9 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             'txn_amount': parsed_amt,
             'txn_small': bool(small),
             'otp_like': bool(otp_like),
+            # New tags for ranking
+            'is_adv': bool(is_adv),
+            'promo_like': bool(promo_near),
         }
         items.append(item)
 
@@ -519,19 +537,27 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 # Ranking (LLM) with JSON-only selection
 # -----------------------------
 RANK_SYSTEM = """You rank candidate emails into Top-5 JSON selections with strict ID-only.
+
 Preferences:
-- Action > FYI; legal/gov/billing outrank others
-- Bills / "payment due" are important
-- Social notifications last
-- When nothing critical, newsletters > promos
-- Transactions ≥100 SGD outrank smaller unless fraud cues
-Return an array of objects: {id, type, category, urgency, why, action}.
+- Action > FYI.
+- Legal/Gov/Billing outrank others.
+- Bills / "payment due" are important.
+- Social notifications last.
+- When nothing critical, prefer newsletters over promos/marketing.
+
+Rules to reduce noise:
+- Do NOT treat large amounts as important if txn_alert=false AND (is_adv=true OR promo_like=true).
+- If is_adv=true or promo_like=true, down-rank unless there is a clear action or deadline.
+- In your "why", avoid citing "large amount mentioned" unless txn_alert=true.
+
+Return ONLY a compact JSON array of objects:
+  {id, type, category, urgency, why, action}
 Only choose from provided IDs; if fewer candidates exist, return fewer.
 """
 
 RANK_USER_TMPL = """You are given a list of emails with fields:
-id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word.
-Choose Top-5 strictly from these IDs. Prefer actionability and legal/gov/billing.
+id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word, is_adv, promo_like.
+Choose Top-5 strictly from these IDs. Prefer actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
 def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
@@ -552,6 +578,8 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
         "txn_amount": it["txn_amount"],
         "txn_small": bool(it["txn_small"]),
         "has_deadline_word": bool(it["has_deadline_word"]),
+        "is_adv": bool(it.get("is_adv")),
+        "promo_like": bool(it.get("promo_like")),
     } for it in items]
 
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
