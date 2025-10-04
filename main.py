@@ -1,4 +1,6 @@
-# main.py — Gmail AI Email Digest
+# main.py — Gmail AI Email Digest (reliability + "old look" UI + ranking fixes A & B)
+# Update: robust string sanitization for LLM fields to prevent html.escape() crashes.
+
 import os
 import time
 import json
