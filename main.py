@@ -1,5 +1,4 @@
-# main.py — Gmail AI Email Digest (reliability + "old look" UI + ranking fixes A & B)
-
+# main.py — Gmail AI Email Digest
 import os
 import time
 import json
@@ -88,6 +87,10 @@ def _extract_headers(msg) -> dict:
 
 def _get_header(headers: dict, name: str, default: str = "") -> str:
     return headers.get(name.lower(), default)
+
+# Always return a safe text string (prevents html.escape crashes)
+def _as_text(v) -> str:
+    return v if isinstance(v, str) else ""
 
 # -----------------------------
 # Gmail auth (accept env b64 or existing files)
@@ -205,13 +208,13 @@ def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bo
     return True, _mask(subject), _mask(body)
 
 # -----------------------------
-# Amount parsing & context (with earlier refined heuristics)
+# Amount parsing & context (with refined heuristics)
 # -----------------------------
 AMOUNT_CURR_RE = re.compile(r'(?i)\b(SGD|USD|EUR|GBP|\$)\s?([0-9]{1,3}(?:[,\s][0-9]{3})*|[0-9]+)(\.[0-9]{2})?\b')
 AMOUNT_SIMPLE_RE = re.compile(r'(?<![0-9])([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(\.[0-9]{2})\b')
 
+# Tightened: no bare "transaction" token
 _NEAR_TXN_RE = re.compile(r'(?i)\b(transaction alert|charged|debited|purchase(?:d)?|withdrawal|transfer(?:red)?|authorized|unauthorized|declined|failed|credited|you(?:’|\'|)ve received|you received)\b')
-# Note: we intentionally removed bare /\btransaction\b/ as an alert trigger.
 
 # Hard negatives near amount (coverage/insurance/limits)
 _NEAR_NEG_RE = re.compile(
@@ -222,7 +225,7 @@ _NEAR_NEG_RE = re.compile(
     r")\b"
 )
 
-# Soft negatives: promo/T&C — used in scoring only elsewhere (left intact here)
+# Soft negatives: promo/T&C — scoring only
 _SOFT_NEG_SCORE_RE = re.compile(
     r"(?i)\b(terms and conditions|tnc|for full terms|promotion|promo|offer|voucher|promo code|unsubscribe|manage preferences)\b"
 )
@@ -479,7 +482,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         parsed_amt = best[1] if best else None
         amount_span = best[2] if best else None
 
-        # Refined is_txn logic (already in place)
+        # Refined is_txn logic
         is_txn = False
         if best:
             center_near_txn = _window_has(_NEAR_TXN_RE, full_body, amount_span, win=120)
@@ -599,17 +602,30 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
             )
             txt = resp.choices[0].message.content.strip()
             top = json.loads(txt)
+
             allowed = {it["id"] for it in items}
             out = []
             for row in top:
                 if isinstance(row, dict) and row.get("id") in allowed:
+                    # Normalize all display fields to text (avoid html.escape crashes)
+                    t_type = _as_text(row.get("type"))
+                    t_cat  = _as_text(row.get("category"))
+                    t_urg  = _as_text(row.get("urgency"))
+                    t_why  = _as_text(row.get("why"))
+                    t_act  = _as_text(row.get("action"))
+                    # Debug if coercion happened
+                    if DEBUG:
+                        for k, v in (("type", row.get("type")), ("category", row.get("category")),
+                                     ("urgency", row.get("urgency")), ("why", row.get("why")), ("action", row.get("action"))):
+                            if v is not None and not isinstance(v, str):
+                                debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
                     out.append({
                         "id": row["id"],
-                        "type": row.get("type"),
-                        "category": row.get("category"),
-                        "urgency": row.get("urgency"),
-                        "why": row.get("why"),
-                        "action": row.get("action"),
+                        "type": t_type,
+                        "category": t_cat,
+                        "urgency": t_urg,
+                        "why": t_why,
+                        "action": t_act,
                     })
                 if len(out) >= 5:
                     break
@@ -655,10 +671,10 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
             it = by_id.get(row["id"], {})
             subj = it.get("subject", "(no subject)")
             frm = it.get("from_raw") or it.get("from_friendly") or it.get("from_domain")
-            why = row.get("why") or ""
-            act = row.get("action") or ""
-            urg = row.get("urgency") or "Low"
-            cat = row.get("category") or "Other"
+            why = _as_text(row.get("why"))
+            act = _as_text(row.get("action"))
+            urg = _as_text(row.get("urgency")) or "Low"
+            cat = _as_text(row.get("category")) or "Other"
             snip = (it.get("snippet") or "").strip()
             plain_lines.append(f"{i}. {subj} — {frm}")
             plain_lines.append(f"   - Category: {cat} | Urgency: {urg}")
@@ -693,12 +709,12 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
             dom = html.escape(it.get("from_domain", "") or "")
             domain_link = f"<a href='https://{dom}' style='color:#2563eb;text-decoration:none'>{dom}</a>" if dom else ""
             snip = html.escape((it.get("snippet") or "").strip())
-            why = html.escape(row.get("why") or "")
-            act = html.escape(row.get("action") or "")
+            why = html.escape(_as_text(row.get("why")))
+            act = html.escape(_as_text(row.get("action")))
             # Normalize badge labels closer to old look
-            cat = _titlecase_or(row.get("category"), "Other")
-            urg = _titlecase_or(row.get("urgency"), "Low")
-            typ = _titlecase_or(row.get("type"), "For Information Only")
+            cat = _titlecase_or(_as_text(row.get("category")), "Other")
+            urg = _titlecase_or(_as_text(row.get("urgency")), "Low")
+            typ = _titlecase_or(_as_text(row.get("type")), "For Information Only")
             # badge colors (soft)
             type_bg = "#dbeafe" if typ == "For Information Only" else "#fde68a"
             cat_bg_map = {"Legal": "#fecaca", "Government": "#fde68a", "Billing" : "#bbf7d0", "Billing/payment": "#bbf7d0", "Other": "#e5e7eb", "Transaction": "#bbf7d0", "Security": "#e9d5ff"}
