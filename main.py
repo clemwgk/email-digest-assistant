@@ -216,6 +216,15 @@ AMOUNT_SIMPLE_RE = re.compile(r'(?<![0-9])([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(\.[0
 
 # Tightened: no bare "transaction" token
 _NEAR_TXN_RE = re.compile(r'(?i)\b(transaction alert|charged|debited|purchase(?:d)?|withdrawal|transfer(?:red)?|authorized|unauthorized|declined|failed|credited|you(?:’|\'|)ve received|you received)\b')
+_NEUTRAL_TXN_RE = re.compile(r'(?i)\b(transaction alert|transfer status|funds transfer|fund transfer)\b')
+_BILLING_CUE_RE = re.compile(r'(?i)\b(invoice|payment due|bill(?:ing)? statement|pay by|due on|outstanding balance|amount due)\b')
+_BOOKING_CUE_RE = re.compile(r'(?i)\b(reservation|booking|check[- ]?in|check[- ]?out|confirmation|hotel|guest|stay|inquiry|question|request)\b')
+_RESERVATION_REF_RE = re.compile(
+    r"(?ix)\b("  # case-insensitive, verbose
+    r"reservation|booking|confirmation|itinerary|record\s+locator|pnr|ticket"
+    r")\s*(?:no\.?|#|num(?:ber)?|code|id|reference|ref|:)?\s*([A-Z0-9]{5,12})\b"
+)
+_MEMBERSHIP_WORD_RE = re.compile(r'(?i)\b(membership|member|loyalty|rewards?|points|club|tier)\b')
 
 # Hard negatives near amount (coverage/insurance/limits)
 _NEAR_NEG_RE = re.compile(
@@ -299,6 +308,10 @@ def _best_amount_by_context(text: str, cands: List[Tuple[str,float,Tuple[int,int
         if d_txn <= 80: score += 3
         if d_neg <= 60: score -= 3
         if d_soft <= 80: score -= 1.5
+        billing_near = _window_has(_BILLING_CUE_RE, text, (a,b), win=120)
+        neutral_txn_near = _window_has(_NEUTRAL_TXN_RE, text, (a,b), win=140)
+        if neutral_txn_near and not billing_near:
+            score -= 2.5
         if is_issuer: score += 1
         score += min(amt, 1000) / 100000.0
         if score > best_score:
@@ -330,7 +343,10 @@ def _extract_smart_snippet_v2(full_text: str, max_len: int, preferred_span: Opti
     for s in sentences:
         score = 0
         if _NEAR_TXN_RE.search(s): score += 2
+        if _BILLING_CUE_RE.search(s) and not _NEUTRAL_TXN_RE.search(s): score += 1.5
         if re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', s): score += 1
+        if _BOOKING_CUE_RE.search(s): score += 1
+        if _has_reservation_reference(s): score += 1.5
         if AMOUNT_CURR_RE.search(s): score += 1
         if score: scored.append((score, s.strip()))
     if scored:
@@ -354,6 +370,59 @@ def promo_like_near_amount(text: str, span: Optional[Tuple[int,int]], win: int =
     a, b = span
     left = max(0, a - win); right = min(len(text), b + win)
     return bool(PROMO_NEAR_AMOUNT.search(text[left:right]))
+
+# -----------------------------
+# Social / billing / booking cues
+# -----------------------------
+SOCIAL_DOMAINS = {
+    "linkedin.com",
+    "notifications.linkedin.com",
+    "facebookmail.com",
+    "messenger.com",
+}
+SOCIAL_KEYWORDS_RE = re.compile(r'(?i)\b(connection|invitation|profile|endorsed|people (?:viewed|are viewing)|add you|join my network)\b')
+
+def _is_social_notification(from_domain: str, subject: str, snippet: str) -> bool:
+    domain = (from_domain or "").lower()
+    if any(domain.endswith(d) for d in SOCIAL_DOMAINS):
+        return True
+    text = f"{subject}\n{snippet}"
+    return bool(SOCIAL_KEYWORDS_RE.search(text))
+
+def _sanitize_snippet_for_social(snippet: str) -> str:
+    if not snippet:
+        return snippet
+    # Collapse bio-like separators early
+    cleaned = re.split(r"\s*[•·|]\s*", snippet, maxsplit=1)[0]
+    cleaned = re.sub(r"(?i)\b(viewed your profile|see who|people you may know).*", "", cleaned).strip()
+    return cleaned or snippet
+
+def _has_billing_cue(text: str, span: Optional[Tuple[int,int]]) -> bool:
+    if span:
+        billing_near = _window_has(_BILLING_CUE_RE, text, span, win=140)
+        neutral_txn_near = _window_has(_NEUTRAL_TXN_RE, text, span, win=140)
+        return bool(billing_near and not neutral_txn_near)
+    return bool(_BILLING_CUE_RE.search(text))
+
+def _is_reply_email(headers: dict, subject: str) -> bool:
+    subj = (subject or "").lstrip()
+    if subj.lower().startswith("re:"):
+        return True
+    return bool(headers.get("in-reply-to") or headers.get("references"))
+
+def _has_booking_cue(text: str) -> bool:
+    return bool(_BOOKING_CUE_RE.search(text))
+
+def _has_reservation_reference(text: str) -> bool:
+    for m in _RESERVATION_REF_RE.finditer(text):
+        # Ignore matches that are clearly tied to memberships/loyalty programs (marketing heavy)
+        left = max(0, m.start() - 48)
+        right = min(len(text), m.end() + 48)
+        ctx = text[left:right]
+        if _MEMBERSHIP_WORD_RE.search(ctx):
+            continue
+        return True
+    return False
 
 # -----------------------------
 # Gmail superset fetch + local filter
@@ -470,7 +539,8 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         # OTP masking
         otp_like, subject, full_body = classify_and_mask_otp(subject, full_body)
         if otp_like:
-            debug_print(f"[OTP] masked codes for id={msg.get('id')} subj={subject!r}")
+            # Avoid leaking subjects (PII) into logs; note only the message id.
+            debug_print(f"[OTP] masked codes for id={msg.get('id')}")
 
         # From domain
         from_domain = (addr.split('@')[-1].lower() if addr else (sender_hdr or "").lower()).strip()
@@ -491,6 +561,8 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             cap_near = _window_has(CAP_WORDS, full_body, amount_span, win=60)
             is_txn = bool(center_near_txn and not center_near_neg and not cap_near)
 
+        billing_cue = _has_billing_cue(full_body, amount_span)
+
         # Tag for ranking fixes (A)
         is_adv = looks_adv(subject)
         promo_near = promo_like_near_amount(full_body, amount_span)
@@ -500,6 +572,14 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             small = (parsed_cur == "SGD" and parsed_amt < TXN_ALERT_MIN)
 
         snippet = _extract_smart_snippet_v2(f"{subject}\n{full_body}", snippet_len, amount_span)
+        is_social = _is_social_notification(from_domain, subject, snippet)
+        if is_social:
+            snippet = _sanitize_snippet_for_social(snippet)
+
+        is_reply = _is_reply_email(headers, subject)
+        booking_text = f"{subject}\n{full_body}"
+        booking_cue = _has_booking_cue(booking_text)
+        reservation_ref = _has_reservation_reference(booking_text)
 
         item = {
             'id': msg.get('id'),
@@ -516,6 +596,11 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
             'txn_amount': parsed_amt,
             'txn_small': bool(small),
             'otp_like': bool(otp_like),
+            'billing_cue': bool(billing_cue),
+            'is_social': bool(is_social),
+            'is_reply': bool(is_reply),
+            'booking_cue': bool(booking_cue),
+            'reservation_ref': bool(reservation_ref),
             # New tags for ranking
             'is_adv': bool(is_adv),
             'promo_like': bool(promo_near),
@@ -548,10 +633,16 @@ Preferences:
 - Bills / "payment due" are important.
 - Social notifications last.
 - When nothing critical, prefer newsletters over promos/marketing.
+- Direct replies to your inquiries or reservation/booking questions are important.
+- Do not treat plain transaction alerts/transfers as billing unless there is a billing cue or a deadline.
 
 Rules to reduce noise:
 - Do NOT treat large amounts as important if txn_alert=false AND (is_adv=true OR promo_like=true).
 - If is_adv=true or promo_like=true, down-rank unless there is a clear action or deadline.
+- Do not mark category=Billing unless has_deadline_word=true OR billing_cue=true; neutral transaction alerts without billing words should be lower urgency.
+- Social/profile notifications (is_social=true) should be last unless they include security/account risk.
+- Prefer replies (is_reply=true) and booking_cue=true over newsletters and promos; when reservation_ref=true treat as more actionable than marketing/membership notices.
+- reservation_ref=true is only for reservation/confirmation codes (not membership IDs); use it to boost genuine booking threads.
 - In your "why", avoid citing "large amount mentioned" unless txn_alert=true.
 
 Return ONLY a compact JSON array of objects:
@@ -560,7 +651,7 @@ Only choose from provided IDs; if fewer candidates exist, return fewer.
 """
 
 RANK_USER_TMPL = """You are given a list of emails with fields:
-id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word, is_adv, promo_like.
+id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word, billing_cue, is_social, is_reply, booking_cue, reservation_ref, is_adv, promo_like.
 Choose Top-5 strictly from these IDs. Prefer actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
@@ -582,6 +673,11 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
         "txn_amount": it["txn_amount"],
         "txn_small": bool(it["txn_small"]),
         "has_deadline_word": bool(it["has_deadline_word"]),
+        "billing_cue": bool(it.get("billing_cue")),
+        "is_social": bool(it.get("is_social")),
+        "is_reply": bool(it.get("is_reply")),
+        "booking_cue": bool(it.get("booking_cue")),
+        "reservation_ref": bool(it.get("reservation_ref")),
         "is_adv": bool(it.get("is_adv")),
         "promo_like": bool(it.get("promo_like")),
     } for it in items]
