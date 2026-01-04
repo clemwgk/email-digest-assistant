@@ -222,7 +222,7 @@ _BOOKING_CUE_RE = re.compile(r'(?i)\b(reservation|booking|check[- ]?in|check[- ]
 _RESERVATION_REF_RE = re.compile(
     r"(?ix)\b("  # case-insensitive, verbose
     r"reservation|booking|confirmation|itinerary|record\s+locator|pnr|ticket"
-    r")\s*(?:no\.?|#|num(?:ber)?|code|id|reference|ref|:)?\s*([A-Z0-9]{5,12})\b"
+    r")\s*(?:no\.?|\#|num(?:ber)?|code|id|reference|ref|:)?\s*([A-Z0-9]{5,12})\b"
 )
 _MEMBERSHIP_WORD_RE = re.compile(r'(?i)\b(membership|member|loyalty|rewards?|points|club|tier)\b')
 
