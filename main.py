@@ -627,7 +627,11 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 # -----------------------------
 RANK_SYSTEM = """You rank candidate emails into Top-5 JSON selections with strict ID-only.
 
-Preferences:
+IMPORTANT: You MUST return EXACTLY 5 items if there are 5 or more candidates.
+Only return fewer than 5 if the total number of candidates is less than 5.
+Every email has some relevance - your job is to RANK them, not filter them out.
+
+Preferences (for ranking order):
 - Action > FYI.
 - Legal/Gov/Billing outrank others.
 - Bills / "payment due" are important.
@@ -636,7 +640,7 @@ Preferences:
 - Direct replies to your inquiries or reservation/booking questions are important.
 - Do not treat plain transaction alerts/transfers as billing unless there is a billing cue or a deadline.
 
-Rules to reduce noise:
+Rules to reduce noise (affects ranking, not exclusion):
 - Do NOT treat large amounts as important if txn_alert=false AND (is_adv=true OR promo_like=true).
 - If is_adv=true or promo_like=true, down-rank unless there is a clear action or deadline.
 - Do not mark category=Billing unless has_deadline_word=true OR billing_cue=true; neutral transaction alerts without billing words should be lower urgency.
@@ -647,12 +651,12 @@ Rules to reduce noise:
 
 Return ONLY a compact JSON array of objects:
   {id, type, category, urgency, why, action}
-Only choose from provided IDs; if fewer candidates exist, return fewer.
+Only choose from provided IDs. Return exactly min(5, number_of_candidates) items.
 """
 
 RANK_USER_TMPL = """You are given a list of emails with fields:
 id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word, billing_cue, is_social, is_reply, booking_cue, reservation_ref, is_adv, promo_like.
-Choose Top-5 strictly from these IDs. Prefer actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
+You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
 def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
@@ -726,6 +730,10 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
                     })
                 if len(out) >= 5:
                     break
+            # Validate: we should have min(5, len(items)) results
+            expected = min(5, len(items))
+            if len(out) < expected:
+                debug_print(f"[Rank] WARNING: Got {len(out)} results, expected {expected}. LLM returned {len(top)} items, {len(top) - len(out)} had invalid IDs.")
             return out, model
         except Exception as e:
             last_err = e
