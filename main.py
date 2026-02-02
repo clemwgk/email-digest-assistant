@@ -24,6 +24,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 from openai import OpenAI
+import google.generativeai as genai
 
 # -----------------------------
 # Env & constants
@@ -51,18 +52,31 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 
-# Model fallback order (keep exact order)
-MODEL_CANDIDATES = [
+# LLM Provider config: "gemini" or "openai"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+
+# OpenAI model fallback order
+OPENAI_MODEL_CANDIDATES = [
     "gpt-5-mini",
     "gpt-5-nano",
     "gpt-4.1-mini",
     "gpt-4o-mini",
     "gpt-3.5-turbo",
 ]
+
+# Gemini model (single model, no fallback needed for free tier)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
 BASE_BACKOFF = 2.0  # seconds
 
-# OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# OpenAI client (initialized if needed)
+openai_client = None
+if LLM_PROVIDER == "openai" or os.getenv("OPENAI_API_KEY"):
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Gemini client (initialized if needed)
+if LLM_PROVIDER == "gemini" and os.getenv("GEMINI_API_KEY"):
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Tunables
 SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))
@@ -659,13 +673,116 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
-def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
-    if not items:
-        return [], MODEL_CANDIDATES[0]
+def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
+    """Parse LLM JSON response and validate IDs."""
+    top = json.loads(txt)
+    allowed = {it["id"] for it in items}
+    out = []
+    for row in top:
+        if isinstance(row, dict) and row.get("id") in allowed:
+            # Normalize all display fields to text (avoid html.escape crashes)
+            t_type = _as_text(row.get("type"))
+            t_cat  = _as_text(row.get("category"))
+            t_urg  = _as_text(row.get("urgency"))
+            t_why  = _as_text(row.get("why"))
+            t_act  = _as_text(row.get("action"))
+            # Debug if coercion happened
+            if DEBUG:
+                for k, v in (("type", row.get("type")), ("category", row.get("category")),
+                             ("urgency", row.get("urgency")), ("why", row.get("why")), ("action", row.get("action"))):
+                    if v is not None and not isinstance(v, str):
+                        debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
+            out.append({
+                "id": row["id"],
+                "type": t_type,
+                "category": t_cat,
+                "urgency": t_urg,
+                "why": t_why,
+                "action": t_act,
+            })
+        if len(out) >= 5:
+            break
+    # Validate: we should have min(5, len(items)) results
+    expected = min(5, len(items))
+    if len(out) < expected:
+        debug_print(f"[Rank] WARNING: Got {len(out)} results, expected {expected}. LLM returned {len(top)} items, {len(top) - len(out)} had invalid IDs.")
+    return out
 
+
+def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
+    """Rank emails using Google Gemini API."""
+    model = GEMINI_MODEL
+    backoff = BASE_BACKOFF
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            gemini_model = genai.GenerativeModel(model)
+            # Gemini uses a single prompt combining system and user messages
+            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            response = gemini_model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=600,
+                )
+            )
+            txt = response.text.strip()
+            # Clean markdown code blocks if present
+            if txt.startswith("```"):
+                txt = txt.split("```")[1]
+                if txt.startswith("json"):
+                    txt = txt[4:]
+                txt = txt.strip()
+            out = _parse_llm_response(txt, items)
+            return out, model
+        except Exception as e:
+            debug_print(f"[Rank:Gemini:{model}] attempt {attempt+1} error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(backoff)
+                backoff *= 2.0
+
+    debug_print(f"[Rank:Gemini] total failure after {max_retries} attempts")
+    return [], model
+
+
+def _llm_rank_openai(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
+    """Rank emails using OpenAI API with model fallback."""
     model_idx = 0
     backoff = BASE_BACKOFF
     last_err = None
+
+    while model_idx < len(OPENAI_MODEL_CANDIDATES):
+        model = OPENAI_MODEL_CANDIDATES[model_idx]
+        try:
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.1,
+                max_tokens=600,
+            )
+            txt = resp.choices[0].message.content.strip()
+            out = _parse_llm_response(txt, items)
+            return out, model
+        except Exception as e:
+            last_err = e
+            debug_print(f"[Rank:OpenAI:{model}] error: {e}")
+            model_idx += 1
+            time.sleep(backoff)
+            backoff *= 2.0
+
+    debug_print(f"[Rank:OpenAI] total failure: {last_err}")
+    return [], OPENAI_MODEL_CANDIDATES[min(model_idx, len(OPENAI_MODEL_CANDIDATES)-1)]
+
+
+def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
+    """Rank emails using configured LLM provider (Gemini or OpenAI)."""
+    if not items:
+        default_model = GEMINI_MODEL if LLM_PROVIDER == "gemini" else OPENAI_MODEL_CANDIDATES[0]
+        return [], default_model
 
     feed = [{
         "id": it["id"],
@@ -689,61 +806,12 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
     sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
 
-    while model_idx < len(MODEL_CANDIDATES):
-        model = MODEL_CANDIDATES[model_idx]
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.1,
-                max_tokens=600,
-            )
-            txt = resp.choices[0].message.content.strip()
-            top = json.loads(txt)
-
-            allowed = {it["id"] for it in items}
-            out = []
-            for row in top:
-                if isinstance(row, dict) and row.get("id") in allowed:
-                    # Normalize all display fields to text (avoid html.escape crashes)
-                    t_type = _as_text(row.get("type"))
-                    t_cat  = _as_text(row.get("category"))
-                    t_urg  = _as_text(row.get("urgency"))
-                    t_why  = _as_text(row.get("why"))
-                    t_act  = _as_text(row.get("action"))
-                    # Debug if coercion happened
-                    if DEBUG:
-                        for k, v in (("type", row.get("type")), ("category", row.get("category")),
-                                     ("urgency", row.get("urgency")), ("why", row.get("why")), ("action", row.get("action"))):
-                            if v is not None and not isinstance(v, str):
-                                debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
-                    out.append({
-                        "id": row["id"],
-                        "type": t_type,
-                        "category": t_cat,
-                        "urgency": t_urg,
-                        "why": t_why,
-                        "action": t_act,
-                    })
-                if len(out) >= 5:
-                    break
-            # Validate: we should have min(5, len(items)) results
-            expected = min(5, len(items))
-            if len(out) < expected:
-                debug_print(f"[Rank] WARNING: Got {len(out)} results, expected {expected}. LLM returned {len(top)} items, {len(top) - len(out)} had invalid IDs.")
-            return out, model
-        except Exception as e:
-            last_err = e
-            debug_print(f"[Rank:{model}] error: {e}")
-            model_idx += 1
-            time.sleep(backoff)
-            backoff *= 2.0
-
-    debug_print(f"[Rank] total failure: {last_err}")
-    return [], MODEL_CANDIDATES[min(model_idx, len(MODEL_CANDIDATES)-1)]
+    if LLM_PROVIDER == "gemini":
+        debug_print(f"[Rank] Using Gemini provider with model {GEMINI_MODEL}")
+        return _llm_rank_gemini(feed, sys_prompt, user_msg, items)
+    else:
+        debug_print(f"[Rank] Using OpenAI provider")
+        return _llm_rank_openai(feed, sys_prompt, user_msg, items)
 
 # -----------------------------
 # Rendering — "old look"
