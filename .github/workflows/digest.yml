@@ -17,6 +17,10 @@ jobs:
       GOOGLE_TOKEN_JSON_B64: ${{ secrets.GMAIL_TOKEN_JSON_B64 }}
       DISABLE_DIGEST: ${{ secrets.DISABLE_DIGEST || '' }}
       DEBUG: ${{ secrets.DEBUG || '' }}
+      # LLM Provider config (gemini or openai)
+      LLM_PROVIDER: ${{ secrets.LLM_PROVIDER || 'gemini' }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
       EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
@@ -56,8 +60,8 @@ jobs:
           echo "${{ secrets.GMAIL_TOKEN_JSON_B64 }}" | base64 --decode > token.json
 
       - run: |
-          printf "OPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
-            "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
+          printf "LLM_PROVIDER=%s\nGEMINI_API_KEY=%s\nGEMINI_MODEL=%s\nOPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
+            "${LLM_PROVIDER}" "${GEMINI_API_KEY}" "${GEMINI_MODEL}" "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
 
       # UPDATED: wrap python with its own start/end stamps
       - name: Run digest (with timing)
