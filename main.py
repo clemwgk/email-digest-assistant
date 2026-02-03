@@ -806,12 +806,26 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
     sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
 
+    # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
-        debug_print(f"[Rank] Using Gemini provider with model {GEMINI_MODEL}")
-        return _llm_rank_gemini(feed, sys_prompt, user_msg, items)
-    else:
-        debug_print(f"[Rank] Using OpenAI provider")
+        if not os.getenv("GEMINI_API_KEY"):
+            debug_print("[Rank] GEMINI_API_KEY not set, falling back to OpenAI")
+        else:
+            debug_print(f"[Rank] Using Gemini provider with model {GEMINI_MODEL}")
+            result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
+            if result:  # Gemini succeeded
+                return result, model
+            # Gemini failed, fall back to OpenAI
+            debug_print("[Rank] Gemini failed, falling back to OpenAI")
+
+    # Use OpenAI (either as primary or fallback)
+    if openai_client:
+        debug_print("[Rank] Using OpenAI provider")
         return _llm_rank_openai(feed, sys_prompt, user_msg, items)
+
+    # No working provider
+    debug_print("[Rank] ERROR: No LLM provider available (no API keys configured)")
+    return [], "none"
 
 # -----------------------------
 # Rendering — "old look"
