@@ -140,7 +140,7 @@ on:
 
 ## How It Works (High Level)
 
-1. **Watermark** – Finds the last sent digest in **Sent** and uses its internal date as “since”; falls back to ~24h.  
+1. **Watermark** – Finds the last sent digest in **Sent** and uses its internal date as “since”; falls back to `last_sent_ts.txt` (local runs) and then ~24h.  
 2. **Pool build** – Fetches all emails since watermark; drops OTPs; thread de-dupes with deadline exceptions.  
 3. **Parsing & snippet** – Reads full body, fixes split decimals, parses amounts with context, builds a windowed snippet around money/date/action cues.  
 4. **Selection** – Prompts an LLM to return structured JSON with `Type/Category/Urgency/Why/Action` for the top K (no hallucinations—IDs must match).  
