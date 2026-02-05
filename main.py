@@ -1034,6 +1034,40 @@ def _read_last_sent_timestamp() -> Optional[int]:
     except Exception:
         return None
 
+def _find_last_sent_timestamp(service) -> Optional[int]:
+    """
+    Find the most recent digest in Gmail Sent and return its internalDate (unix seconds).
+    """
+    user_id = "me"
+    query = 'in:sent subject:"AI Email Digest ("'
+    try:
+        resp = _with_retries(
+            lambda: service.users().messages().list(
+                userId=user_id,
+                q=query,
+                maxResults=1,
+                includeSpamTrash=False,
+            ).execute(),
+            what="messages.list[sent-digest]"
+        )
+        msgs = resp.get("messages", []) or []
+        if not msgs:
+            return None
+        msg_id = msgs[0]["id"]
+        msg = _with_retries(
+            lambda: service.users().messages().get(
+                userId=user_id,
+                id=msg_id,
+                format="minimal",
+            ).execute(),
+            what=f"messages.get[sent-digest:{msg_id}]"
+        )
+        ts_ms = int(msg.get("internalDate", "0"))
+        return ts_ms // 1000 if ts_ms else None
+    except Exception as exc:
+        debug_print(f"[Watermark] Sent digest lookup failed: {exc}")
+        return None
+
 def _write_last_sent_timestamp(ts: int):
     with open("last_sent_ts.txt", "w") as f:
         f.write(str(ts))
@@ -1050,7 +1084,11 @@ def main():
         service = _gmail_service()
 
         now = int(time.time())
-        last_sent = _read_last_sent_timestamp() or (now - 86400)
+        last_sent = (
+            _find_last_sent_timestamp(service)
+            or _read_last_sent_timestamp()
+            or (now - 86400)
+        )
         since_unix = max(0, last_sent - SINCE_BUFFER_HOURS * 3600)
 
         print("UTC now:", datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%d %H:%M"))
