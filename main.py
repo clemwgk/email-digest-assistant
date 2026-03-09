@@ -65,7 +65,9 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Default to Gemini 2.5 Flash, which is generally stronger than Flash-Lite
+# while still offering a free usage tier (rate-limited) in Google AI Studio.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 BASE_BACKOFF = 2.0  # seconds
 

@@ -26,7 +26,7 @@ Runs locally or on **GitHub Actions** so it’s laptop-agnostic.
 ### Prerequisites
 - Python **3.11+**
 - A Gmail account you control
-- An OpenAI API key
+- An OpenAI API key (optional if using Gemini)
 
 ### 1) Create a virtual environment & install
 
@@ -57,9 +57,13 @@ cp .env.example .env
 ~~~
 
 Then edit `.env` and set:
-- OPENAI_API_KEY=...
+- LLM_PROVIDER=gemini
+- GEMINI_API_KEY=...
+- GEMINI_MODEL=gemini-2.5-flash
 - EMAIL_USERNAME=your_gmail_address
 - EMAIL_APP_PASSWORD=your_gmail_app_password
+
+(If you prefer OpenAI, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY=...` instead.)
 > Optional:
 > SNIPPET_LEN=350
 > TXN_ALERT_MIN=100
@@ -133,7 +137,9 @@ on:
 | `DISABLE_DIGEST`  | (blank) | Set `1` to pause runs cleanly                                                        |
 | `DEBUG`           | (blank) | Set `1` for verbose logs (avoid in public repos)                                    |
 
-**Model fallback** (with 4 retries + backoff):  
+**Gemini default (free-tier friendly):** `gemini-2.5-flash` (override via `GEMINI_MODEL`)
+
+**OpenAI fallback** (with 4 retries + backoff):  
 `gpt-5-mini → gpt-5-nano → gpt-4.1-mini → gpt-4o-mini → gpt-3.5-turbo`
 
 ---
