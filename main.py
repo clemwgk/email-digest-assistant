@@ -675,9 +675,63 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
+def _extract_json_array_text(txt: str) -> str:
+    """Extract first JSON array from model text, handling markdown/code wrappers."""
+    s = (txt or "").strip().replace("\ufeff", "")
+    if s.startswith("```"):
+        parts = s.split("```")
+        if len(parts) >= 2:
+            s = parts[1].strip()
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
+
+    start = s.find("[")
+    if start == -1:
+        return s
+
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
+
+    return s[start:]
+
+
 def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     """Parse LLM JSON response and validate IDs."""
-    top = json.loads(txt)
+    parse_attempts = []
+    raw = (txt or "").strip()
+    extracted = _extract_json_array_text(raw)
+
+    for label, candidate in (("raw", raw), ("extracted", extracted), ("sanitized", extracted.replace("\x00", ""))):
+        if not candidate:
+            continue
+        try:
+            top = json.loads(candidate)
+            break
+        except json.JSONDecodeError as err:
+            parse_attempts.append(f"{label}:{err}")
+    else:
+        preview = extracted[:300].replace("\n", "\\n")
+        raise ValueError(f"LLM JSON parse failed ({'; '.join(parse_attempts)}) preview={preview}")
+
     allowed = {it["id"] for it in items}
     out = []
     for row in top:
@@ -725,17 +779,12 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
             response = gemini_model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
+                    temperature=0,
                     max_output_tokens=600,
+                    response_mime_type="application/json",
                 )
             )
-            txt = response.text.strip()
-            # Clean markdown code blocks if present
-            if txt.startswith("```"):
-                txt = txt.split("```")[1]
-                if txt.startswith("json"):
-                    txt = txt[4:]
-                txt = txt.strip()
+            txt = (response.text or "").strip()
             out = _parse_llm_response(txt, items)
             if out:
                 print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
