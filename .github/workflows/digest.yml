@@ -63,6 +63,36 @@ jobs:
           printf "LLM_PROVIDER=%s\nGEMINI_API_KEY=%s\nGEMINI_MODEL=%s\nOPENAI_API_KEY=%s\nEMAIL_USERNAME=%s\nEMAIL_APP_PASSWORD=%s\n" \
             "${LLM_PROVIDER}" "${GEMINI_API_KEY}" "${GEMINI_MODEL}" "${OPENAI_API_KEY}" "${EMAIL_USERNAME}" "${EMAIL_APP_PASSWORD}" > .env
 
+      - name: LLM preflight validation
+        run: |
+          echo "LLM provider: ${LLM_PROVIDER}"
+          echo "GEMINI_MODEL: ${GEMINI_MODEL}"
+          if [ -n "${GEMINI_API_KEY}" ]; then
+            echo "GEMINI_API_KEY present: yes"
+          else
+            echo "GEMINI_API_KEY present: no"
+          fi
+          if [ -n "${OPENAI_API_KEY}" ]; then
+            echo "OPENAI_API_KEY present: yes"
+          else
+            echo "OPENAI_API_KEY present: no"
+          fi
+
+          if [ "${LLM_PROVIDER}" != "gemini" ] && [ "${LLM_PROVIDER}" != "openai" ]; then
+            echo "Invalid LLM_PROVIDER='${LLM_PROVIDER}'. Must be 'gemini' or 'openai'."
+            exit 1
+          fi
+
+          if [ "${LLM_PROVIDER}" = "gemini" ] && [ -z "${GEMINI_API_KEY}" ]; then
+            echo "LLM preflight failed: LLM_PROVIDER=gemini but GEMINI_API_KEY is missing."
+            exit 1
+          fi
+
+          if [ "${LLM_PROVIDER}" = "openai" ] && [ -z "${OPENAI_API_KEY}" ]; then
+            echo "LLM preflight failed: LLM_PROVIDER=openai but OPENAI_API_KEY is missing."
+            exit 1
+          fi
+
       # UPDATED: wrap python with its own start/end stamps
       - name: Run digest (with timing)
         run: |

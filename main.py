@@ -675,9 +675,63 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
+def _extract_json_array_text(txt: str) -> str:
+    """Extract first JSON array from model text, handling markdown/code wrappers."""
+    s = (txt or "").strip().replace("\ufeff", "")
+    if s.startswith("```"):
+        parts = s.split("```")
+        if len(parts) >= 2:
+            s = parts[1].strip()
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
+
+    start = s.find("[")
+    if start == -1:
+        return s
+
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
+
+    return s[start:]
+
+
 def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     """Parse LLM JSON response and validate IDs."""
-    top = json.loads(txt)
+    parse_attempts = []
+    raw = (txt or "").strip()
+    extracted = _extract_json_array_text(raw)
+
+    for label, candidate in (("raw", raw), ("extracted", extracted), ("sanitized", extracted.replace("\x00", ""))):
+        if not candidate:
+            continue
+        try:
+            top = json.loads(candidate)
+            break
+        except json.JSONDecodeError as err:
+            parse_attempts.append(f"{label}:{err}")
+    else:
+        preview = extracted[:300].replace("\n", "\\n")
+        raise ValueError(f"LLM JSON parse failed ({'; '.join(parse_attempts)}) preview={preview}")
+
     allowed = {it["id"] for it in items}
     out = []
     for row in top:
@@ -725,26 +779,25 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
             response = gemini_model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,
+                    temperature=0,
                     max_output_tokens=600,
+                    response_mime_type="application/json",
                 )
             )
-            txt = response.text.strip()
-            # Clean markdown code blocks if present
-            if txt.startswith("```"):
-                txt = txt.split("```")[1]
-                if txt.startswith("json"):
-                    txt = txt[4:]
-                txt = txt.strip()
+            txt = (response.text or "").strip()
             out = _parse_llm_response(txt, items)
+            if out:
+                print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
+            else:
+                print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
             return out, model
         except Exception as e:
-            debug_print(f"[Rank:Gemini:{model}] attempt {attempt+1} error: {e}")
+            print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    debug_print(f"[Rank:Gemini] total failure after {max_retries} attempts")
+    print(f"[LLM] Gemini model={model} total failure after {max_retries} attempts")
     return [], model
 
 
@@ -757,6 +810,7 @@ def _llm_rank_openai(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
     while model_idx < len(OPENAI_MODEL_CANDIDATES):
         model = OPENAI_MODEL_CANDIDATES[model_idx]
         try:
+            print(f"[LLM] Trying OpenAI model candidate: {model}")
             resp = openai_client.chat.completions.create(
                 model=model,
                 messages=[
@@ -768,20 +822,28 @@ def _llm_rank_openai(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
             )
             txt = resp.choices[0].message.content.strip()
             out = _parse_llm_response(txt, items)
+            print(f"[LLM] OpenAI model={model} produced {len(out)} ranking items")
             return out, model
         except Exception as e:
             last_err = e
-            debug_print(f"[Rank:OpenAI:{model}] error: {e}")
+            print(f"[LLM] OpenAI model={model} failed: {type(e).__name__}: {e}")
             model_idx += 1
             time.sleep(backoff)
             backoff *= 2.0
 
-    debug_print(f"[Rank:OpenAI] total failure: {last_err}")
+    print(f"[LLM] OpenAI total failure: {type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}")
     return [], OPENAI_MODEL_CANDIDATES[min(model_idx, len(OPENAI_MODEL_CANDIDATES)-1)]
 
 
 def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
     """Rank emails using configured LLM provider (Gemini or OpenAI)."""
+    has_gemini_key = bool(os.getenv("GEMINI_API_KEY"))
+    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    print(
+        f"[LLM] provider={LLM_PROVIDER} gemini_key_present={has_gemini_key} "
+        f"openai_key_present={has_openai_key} gemini_model={GEMINI_MODEL}"
+    )
+
     if not items:
         default_model = GEMINI_MODEL if LLM_PROVIDER == "gemini" else OPENAI_MODEL_CANDIDATES[0]
         return [], default_model
@@ -810,23 +872,23 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
 
     # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
-        if not os.getenv("GEMINI_API_KEY"):
-            debug_print("[Rank] GEMINI_API_KEY not set, falling back to OpenAI")
+        if not has_gemini_key:
+            print("[LLM] Fallback to OpenAI because GEMINI_API_KEY is missing")
         else:
-            debug_print(f"[Rank] Using Gemini provider with model {GEMINI_MODEL}")
+            print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
             result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
             if result:  # Gemini succeeded
                 return result, model
             # Gemini failed, fall back to OpenAI
-            debug_print("[Rank] Gemini failed, falling back to OpenAI")
+            print("[LLM] Fallback to OpenAI because Gemini ranking failed")
 
     # Use OpenAI (either as primary or fallback)
     if openai_client:
-        debug_print("[Rank] Using OpenAI provider")
+        print("[LLM] Using OpenAI provider")
         return _llm_rank_openai(feed, sys_prompt, user_msg, items)
 
     # No working provider
-    debug_print("[Rank] ERROR: No LLM provider available (no API keys configured)")
+    print("[LLM] ERROR: No LLM provider available (no API keys configured)")
     return [], "none"
 
 # -----------------------------
@@ -1100,6 +1162,8 @@ def main():
         considered_count = len(items)
 
         top, used_model = llm_rank(items)
+        provider_used = "gemini" if used_model.startswith("gemini") else ("openai" if used_model.startswith("gpt-") else "none")
+        print(f"[LLM] Summary: provider_used={provider_used} model_used={used_model} top_items={len(top)}")
 
         plain, html_body = render_digest(items, top, since_unix, now, considered_count, used_model)
         subject = f"AI Email Digest ({datetime.datetime.fromtimestamp(now, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})"
