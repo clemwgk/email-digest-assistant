@@ -765,6 +765,54 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     return out
 
 
+class GeminiTruncatedOutput(RuntimeError):
+    """Raised when Gemini repeatedly returns incomplete/truncated JSON output."""
+
+
+def _gemini_candidate_metadata(response) -> Dict[str, str]:
+    """Extract candidate metadata for diagnostics without assuming SDK shape."""
+    meta: Dict[str, str] = {}
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        first = candidates[0]
+        finish = getattr(first, "finish_reason", None)
+        if finish is not None:
+            meta["finish_reason"] = str(finish)
+        safety = getattr(first, "safety_ratings", None)
+        if safety:
+            meta["safety_ratings"] = str(safety)
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        meta["usage_metadata"] = str(usage)
+    return meta
+
+
+def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, str]:
+    payload = (txt or "").rstrip()
+    if not payload:
+        return True, "empty payload"
+    if "]" not in payload or not payload.endswith("]"):
+        return True, "missing closing ]"
+
+    quote_count = 0
+    escaped = False
+    for ch in payload:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quote_count += 1
+    if quote_count % 2 == 1:
+        return True, "payload ends mid-string"
+
+    finish_upper = (finish_reason or "").upper()
+    if any(tok in finish_upper for tok in ("MAX", "TOKEN", "INCOMPLETE")):
+        return True, f"finish_reason={finish_reason}"
+    return False, ""
+
+
 def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
     """Rank emails using Google Gemini API."""
     model = GEMINI_MODEL
@@ -772,19 +820,48 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
     max_retries = 3
 
     for attempt in range(max_retries):
+        id_only_mode = attempt >= 1
+        max_output_tokens = 600 + (attempt * 100)
         try:
             gemini_model = genai.GenerativeModel(model)
             # Gemini uses a single prompt combining system and user messages
-            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            prompt_suffix = ""
+            if id_only_mode:
+                prompt_suffix = (
+                    "\n\nOutput-minimization mode: return JSON array ONLY with objects containing "
+                    "an `id` field from the provided items, e.g. [{\"id\":\"m1\"}]. "
+                    "No extra keys, no commentary."
+                )
+            full_prompt = f"{sys_prompt}\n\n{user_msg}{prompt_suffix}"
             response = gemini_model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=600,
+                    max_output_tokens=max_output_tokens,
                     response_mime_type="application/json",
                 )
             )
             txt = (response.text or "").strip()
+            meta = _gemini_candidate_metadata(response)
+            finish_reason = meta.get("finish_reason", "")
+            print(
+                f"[LLM] Gemini metadata attempt={attempt + 1}/{max_retries} "
+                f"id_only_mode={id_only_mode} max_output_tokens={max_output_tokens} "
+                f"meta={meta}"
+            )
+            truncated, reason = _looks_truncated_json_payload(txt, finish_reason)
+            if truncated:
+                if attempt < max_retries - 1:
+                    print(
+                        f"[LLM] Gemini likely truncation attempt={attempt + 1}/{max_retries}: {reason}. "
+                        "Retrying with reduced output requirements."
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                raise GeminiTruncatedOutput(
+                    f"GeminiTruncatedOutput: incomplete output after {max_retries} attempts; reason={reason}"
+                )
             out = _parse_llm_response(txt, items)
             if out:
                 print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
