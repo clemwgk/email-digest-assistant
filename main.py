@@ -769,18 +769,37 @@ class GeminiTruncatedOutput(RuntimeError):
     """Raised when Gemini repeatedly returns incomplete/truncated JSON output."""
 
 
+def _normalize_finish_reason(raw_finish) -> str:
+    """Best-effort extraction of finish reason label across SDK versions."""
+    if raw_finish is None:
+        return ""
+    name = getattr(raw_finish, "name", None)
+    if name:
+        return str(name)
+    text = str(raw_finish)
+    if "." in text:
+        return text.split(".")[-1]
+    return text
+
+
 def _gemini_candidate_metadata(response) -> Dict[str, str]:
     """Extract candidate metadata for diagnostics without assuming SDK shape."""
     meta: Dict[str, str] = {}
     candidates = getattr(response, "candidates", None) or []
-    if candidates:
-        first = candidates[0]
-        finish = getattr(first, "finish_reason", None)
-        if finish is not None:
-            meta["finish_reason"] = str(finish)
-        safety = getattr(first, "safety_ratings", None)
-        if safety:
-            meta["safety_ratings"] = str(safety)
+    finish_reasons = []
+    safety = []
+    for cand in candidates:
+        finish = _normalize_finish_reason(getattr(cand, "finish_reason", None))
+        if finish:
+            finish_reasons.append(finish)
+        ratings = getattr(cand, "safety_ratings", None)
+        if ratings:
+            safety.append(str(ratings))
+    if finish_reasons:
+        meta["finish_reasons"] = ",".join(finish_reasons)
+        meta["finish_reason"] = finish_reasons[0]
+    if safety:
+        meta["safety_ratings"] = " | ".join(safety)
     usage = getattr(response, "usage_metadata", None)
     if usage:
         meta["usage_metadata"] = str(usage)
@@ -791,12 +810,14 @@ def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, s
     payload = (txt or "").rstrip()
     if not payload:
         return True, "empty payload"
-    if "]" not in payload or not payload.endswith("]"):
+
+    extracted = _extract_json_array_text(payload)
+    if not extracted or "]" not in extracted or not extracted.endswith("]"):
         return True, "missing closing ]"
 
     quote_count = 0
     escaped = False
-    for ch in payload:
+    for ch in extracted:
         if escaped:
             escaped = False
             continue
@@ -808,7 +829,7 @@ def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, s
         return True, "payload ends mid-string"
 
     finish_upper = (finish_reason or "").upper()
-    if any(tok in finish_upper for tok in ("MAX", "TOKEN", "INCOMPLETE")):
+    if any(tok in finish_upper for tok in ("MAX", "TOKEN", "INCOMPLETE", "LENGTH")):
         return True, f"finish_reason={finish_reason}"
     return False, ""
 
@@ -818,6 +839,7 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
     model = GEMINI_MODEL
     backoff = BASE_BACKOFF
     max_retries = 3
+    last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
         id_only_mode = attempt >= 1
@@ -851,17 +873,16 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
             )
             truncated, reason = _looks_truncated_json_payload(txt, finish_reason)
             if truncated:
+                last_err = GeminiTruncatedOutput(
+                    f"GeminiTruncatedOutput: likely incomplete output on attempt {attempt + 1}/{max_retries}; reason={reason}"
+                )
                 if attempt < max_retries - 1:
-                    print(
-                        f"[LLM] Gemini likely truncation attempt={attempt + 1}/{max_retries}: {reason}. "
-                        "Retrying with reduced output requirements."
-                    )
+                    print(f"[LLM] {last_err}. Retrying with reduced output requirements.")
                     time.sleep(backoff)
                     backoff *= 2.0
                     continue
-                raise GeminiTruncatedOutput(
-                    f"GeminiTruncatedOutput: incomplete output after {max_retries} attempts; reason={reason}"
-                )
+                raise last_err
+
             out = _parse_llm_response(txt, items)
             if out:
                 print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
@@ -869,12 +890,16 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
                 print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
             return out, model
         except Exception as e:
+            last_err = e
             print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    print(f"[LLM] Gemini model={model} total failure after {max_retries} attempts")
+    print(
+        f"[LLM] Gemini model={model} total failure after {max_retries} attempts: "
+        f"{type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}"
+    )
     return [], model
 
 
