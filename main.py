@@ -675,6 +675,23 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
+RANK_SYSTEM_GEMINI_IDS = """You rank candidate emails into a Top-N ordered list of message IDs.
+
+Return ONLY a compact JSON array of strings, e.g. ["id1","id2","id3"].
+Do not return prose, markdown, comments, or any keys/objects.
+Only use IDs from the provided candidates. Keep order from highest to lowest priority.
+Return exactly min(5, number_of_candidates) unique IDs.
+
+Ranking guidance:
+- Action > FYI.
+- Legal/Gov/Billing outrank others.
+- Bills / payment due are important.
+- Social notifications last unless security/account risk.
+- Prefer replies and booking/reservation threads over newsletters/promos.
+- If is_adv=true or promo_like=true and no clear action/deadline, down-rank.
+- Neutral transaction alerts without billing words should be lower urgency.
+"""
+
 def _extract_json_array_text(txt: str) -> str:
     """Extract first JSON array from model text, handling markdown/code wrappers."""
     s = (txt or "").strip().replace("\ufeff", "")
@@ -976,6 +993,7 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
 
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
     sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
+    gemini_user_msg = "Rank the following candidate emails and return only ordered IDs.\n\n" + json.dumps(feed, ensure_ascii=False)
 
     # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
@@ -983,7 +1001,7 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
             print("[LLM] Fallback to OpenAI because GEMINI_API_KEY is missing")
         else:
             print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
-            result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
+            result, model = _llm_rank_gemini(feed, RANK_SYSTEM_GEMINI_IDS, gemini_user_msg, items)
             if result:  # Gemini succeeded
                 return result, model
             # Gemini failed, fall back to OpenAI
