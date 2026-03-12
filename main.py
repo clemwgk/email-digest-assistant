@@ -675,6 +675,23 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
+RANK_SYSTEM_GEMINI_IDS = """You rank candidate emails into a Top-N ordered list of message IDs.
+
+Return ONLY a compact JSON array of strings, e.g. ["id1","id2","id3"].
+Do not return prose, markdown, comments, or any keys/objects.
+Only use IDs from the provided candidates. Keep order from highest to lowest priority.
+Return exactly min(5, number_of_candidates) unique IDs.
+
+Ranking guidance:
+- Action > FYI.
+- Legal/Gov/Billing outrank others.
+- Bills / payment due are important.
+- Social notifications last unless security/account risk.
+- Prefer replies and booking/reservation threads over newsletters/promos.
+- If is_adv=true or promo_like=true and no clear action/deadline, down-rank.
+- Neutral transaction alerts without billing words should be lower urgency.
+"""
+
 def _extract_json_array_text(txt: str) -> str:
     """Extract first JSON array from model text, handling markdown/code wrappers."""
     s = (txt or "").strip().replace("\ufeff", "")
@@ -765,6 +782,112 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     return out
 
 
+def _parse_llm_id_array(txt: str, items: List[dict]) -> List[str]:
+    """Parse ordered JSON array of message IDs and validate against allowed items."""
+    parse_attempts = []
+    raw = (txt or "").strip()
+    extracted = _extract_json_array_text(raw)
+
+    for label, candidate in (("raw", raw), ("extracted", extracted), ("sanitized", extracted.replace("\x00", ""))):
+        if not candidate:
+            continue
+        try:
+            top = json.loads(candidate)
+            break
+        except json.JSONDecodeError as err:
+            parse_attempts.append(f"{label}:{err}")
+    else:
+        preview = extracted[:300].replace("\n", "\\n")
+        raise ValueError(f"LLM ID-array parse failed ({'; '.join(parse_attempts)}) preview={preview}")
+
+    if not isinstance(top, list):
+        raise ValueError(f"LLM ID-array parse failed: expected list, got {type(top).__name__}")
+
+    allowed = {it["id"] for it in items}
+    out_ids = []
+    seen = set()
+    for row in top:
+        if isinstance(row, str) and row in allowed and row not in seen:
+            out_ids.append(row)
+            seen.add(row)
+        if len(out_ids) >= min(5, len(items)):
+            break
+    return out_ids
+
+
+def _rank_defaults_from_item(item: dict) -> dict:
+    """Build deterministic digest fields when model returns IDs only."""
+    domain = (item.get("from_domain") or "").lower()
+    subject = (item.get("subject") or "").lower()
+
+    is_gov = domain.endswith(".gov") or ".gov." in domain or any(k in domain for k in ["gov", "iras", "mom", "cpf", "ica"])
+    is_security = bool(item.get("otp_like")) or "security" in subject or "password" in subject
+    is_billing = bool(item.get("has_deadline_word")) or bool(item.get("billing_cue"))
+
+    category = "Other"
+    if is_security:
+        category = "Security"
+    elif is_gov:
+        category = "Government"
+    elif is_billing:
+        category = "Billing"
+    elif item.get("txn_alert"):
+        category = "Transaction"
+    elif item.get("is_social"):
+        category = "Social"
+
+    urgency = "Low"
+    if is_security or is_billing:
+        urgency = "High"
+    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref") or item.get("txn_alert"):
+        urgency = "Medium"
+
+    msg_type = "FYI"
+    if urgency != "Low" or item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
+        msg_type = "Action"
+
+    why = "Prioritized by ranked ID and message signals."
+    if is_security:
+        why = "Contains security/account verification cues."
+    elif is_billing:
+        why = "Contains billing or payment deadline cues."
+    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
+        why = "Likely a direct response or booking-related update."
+    elif item.get("is_adv") or item.get("promo_like"):
+        why = "Marketing or promotional content; lower actionability."
+
+    action = "Review when convenient."
+    if is_security:
+        action = "Verify activity and act immediately if unexpected."
+    elif is_billing:
+        action = "Check due date and complete required payment/action."
+    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
+        action = "Review details and follow up if needed."
+
+    return {
+        "type": msg_type,
+        "category": category,
+        "urgency": urgency,
+        "why": why,
+        "action": action,
+    }
+
+
+def _rows_from_ranked_ids(ranked_ids: List[str], items: List[dict]) -> Tuple[List[dict], bool]:
+    """Convert ranked IDs to digest rows using deterministic defaults/heuristics."""
+    by_id = {it["id"]: it for it in items}
+    rows = []
+    used_defaults = False
+    for msg_id in ranked_ids[:min(5, len(items))]:
+        item = by_id.get(msg_id)
+        if not item:
+            continue
+        defaults = _rank_defaults_from_item(item)
+        used_defaults = True
+        rows.append({"id": msg_id, **defaults})
+    return rows, used_defaults
+
+
 def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
     """Rank emails using Google Gemini API."""
     model = GEMINI_MODEL
@@ -785,11 +908,12 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
                 )
             )
             txt = (response.text or "").strip()
-            out = _parse_llm_response(txt, items)
-            if out:
-                print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
-            else:
-                print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
+            ranked_ids = _parse_llm_id_array(txt, items)
+            out, used_defaults = _rows_from_ranked_ids(ranked_ids, items)
+            print(
+                f"[LLM] Gemini model={model} parsed_valid_ids={len(ranked_ids)} "
+                f"ranking_items={len(out)} defaults_or_heuristics_applied={used_defaults}"
+            )
             return out, model
         except Exception as e:
             print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
@@ -869,6 +993,7 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
 
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
     sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
+    gemini_user_msg = "Rank the following candidate emails and return only ordered IDs.\n\n" + json.dumps(feed, ensure_ascii=False)
 
     # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
@@ -876,7 +1001,7 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
             print("[LLM] Fallback to OpenAI because GEMINI_API_KEY is missing")
         else:
             print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
-            result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
+            result, model = _llm_rank_gemini(feed, RANK_SYSTEM_GEMINI_IDS, gemini_user_msg, items)
             if result:  # Gemini succeeded
                 return result, model
             # Gemini failed, fall back to OpenAI
