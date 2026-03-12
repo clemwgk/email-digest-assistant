@@ -65,9 +65,8 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-# Default to Gemini 2.5 Flash, which is generally stronger than Flash-Lite
-# while still offering a free usage tier (rate-limited) in Google AI Studio.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Default to Gemini 2.5 Flash-Lite for better headroom on constrained/free-tier usage.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 BASE_BACKOFF = 2.0  # seconds
 
@@ -765,26 +764,129 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     return out
 
 
+class GeminiTruncatedOutput(RuntimeError):
+    """Raised when Gemini repeatedly returns incomplete/truncated JSON output."""
+
+
+def _normalize_finish_reason(raw_finish) -> str:
+    """Best-effort extraction of finish reason label across SDK versions."""
+    if raw_finish is None:
+        return ""
+    name = getattr(raw_finish, "name", None)
+    if name:
+        return str(name)
+    text = str(raw_finish)
+    if "." in text:
+        return text.split(".")[-1]
+    return text
+
+
+def _gemini_candidate_metadata(response) -> Dict[str, str]:
+    """Extract candidate metadata for diagnostics without assuming SDK shape."""
+    meta: Dict[str, str] = {}
+    candidates = getattr(response, "candidates", None) or []
+    finish_reasons = []
+    safety = []
+    for cand in candidates:
+        finish = _normalize_finish_reason(getattr(cand, "finish_reason", None))
+        if finish:
+            finish_reasons.append(finish)
+        ratings = getattr(cand, "safety_ratings", None)
+        if ratings:
+            safety.append(str(ratings))
+    if finish_reasons:
+        meta["finish_reasons"] = ",".join(finish_reasons)
+        meta["finish_reason"] = finish_reasons[0]
+    if safety:
+        meta["safety_ratings"] = " | ".join(safety)
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        meta["usage_metadata"] = str(usage)
+    return meta
+
+
+def _finish_reason_indicates_incomplete(finish_reason: str) -> bool:
+    tokens = ("MAX", "MAX_TOKENS", "TOKEN", "INCOMPLETE", "LENGTH")
+    upper = (finish_reason or "").upper()
+    return any(tok in upper for tok in tokens)
+
+
+def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, str]:
+    payload = (txt or "").rstrip()
+    if not payload:
+        return True, "empty payload"
+
+    extracted = _extract_json_array_text(payload)
+    if not extracted or "]" not in extracted or not extracted.endswith("]"):
+        return True, "missing closing ]"
+
+    quote_count = 0
+    escaped = False
+    for ch in extracted:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quote_count += 1
+    if quote_count % 2 == 1:
+        return True, "payload ends mid-string"
+
+    if _finish_reason_indicates_incomplete(finish_reason):
+        return True, f"finish_reason={finish_reason}"
+    return False, ""
+
+
 def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
     """Rank emails using Google Gemini API."""
     model = GEMINI_MODEL
     backoff = BASE_BACKOFF
     max_retries = 3
+    last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
+        id_only_mode = attempt >= 1
+        max_output_tokens = 600 + (attempt * 100)
         try:
             gemini_model = genai.GenerativeModel(model)
             # Gemini uses a single prompt combining system and user messages
-            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            prompt_suffix = ""
+            if id_only_mode:
+                prompt_suffix = (
+                    "\n\nOutput-minimization mode: return JSON array ONLY with objects containing "
+                    "an `id` field from the provided items, e.g. [{\"id\":\"m1\"}]. "
+                    "No extra keys, no commentary."
+                )
+            full_prompt = f"{sys_prompt}\n\n{user_msg}{prompt_suffix}"
             response = gemini_model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=600,
+                    max_output_tokens=max_output_tokens,
                     response_mime_type="application/json",
                 )
             )
             txt = (response.text or "").strip()
+            meta = _gemini_candidate_metadata(response)
+            finish_reason = meta.get("finish_reasons", meta.get("finish_reason", ""))
+            print(
+                f"[LLM] Gemini metadata attempt={attempt + 1}/{max_retries} "
+                f"id_only_mode={id_only_mode} max_output_tokens={max_output_tokens} "
+                f"meta={meta}"
+            )
+            truncated, reason = _looks_truncated_json_payload(txt, finish_reason)
+            if truncated:
+                last_err = GeminiTruncatedOutput(
+                    f"GeminiTruncatedOutput: likely incomplete output on attempt {attempt + 1}/{max_retries}; reason={reason}"
+                )
+                if attempt < max_retries - 1:
+                    print(f"[LLM] {last_err}. Retrying with reduced output requirements.")
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                raise last_err
+
             out = _parse_llm_response(txt, items)
             if out:
                 print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
@@ -792,12 +894,16 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
                 print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
             return out, model
         except Exception as e:
+            last_err = e
             print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    print(f"[LLM] Gemini model={model} total failure after {max_retries} attempts")
+    print(
+        f"[LLM] Gemini model={model} total failure after {max_retries} attempts: "
+        f"{type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}"
+    )
     return [], model
 
 
