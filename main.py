@@ -782,110 +782,78 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
     return out
 
 
-def _parse_llm_id_array(txt: str, items: List[dict]) -> List[str]:
-    """Parse ordered JSON array of message IDs and validate against allowed items."""
-    parse_attempts = []
-    raw = (txt or "").strip()
-    extracted = _extract_json_array_text(raw)
+class GeminiTruncatedOutput(RuntimeError):
+    """Raised when Gemini repeatedly returns incomplete/truncated JSON output."""
 
-    for label, candidate in (("raw", raw), ("extracted", extracted), ("sanitized", extracted.replace("\x00", ""))):
-        if not candidate:
+
+def _normalize_finish_reason(raw_finish) -> str:
+    """Best-effort extraction of finish reason label across SDK versions."""
+    if raw_finish is None:
+        return ""
+    name = getattr(raw_finish, "name", None)
+    if name:
+        return str(name)
+    text = str(raw_finish)
+    if "." in text:
+        return text.split(".")[-1]
+    return text
+
+
+def _gemini_candidate_metadata(response) -> Dict[str, str]:
+    """Extract candidate metadata for diagnostics without assuming SDK shape."""
+    meta: Dict[str, str] = {}
+    candidates = getattr(response, "candidates", None) or []
+    finish_reasons = []
+    safety = []
+    for cand in candidates:
+        finish = _normalize_finish_reason(getattr(cand, "finish_reason", None))
+        if finish:
+            finish_reasons.append(finish)
+        ratings = getattr(cand, "safety_ratings", None)
+        if ratings:
+            safety.append(str(ratings))
+    if finish_reasons:
+        meta["finish_reasons"] = ",".join(finish_reasons)
+        meta["finish_reason"] = finish_reasons[0]
+    if safety:
+        meta["safety_ratings"] = " | ".join(safety)
+    usage = getattr(response, "usage_metadata", None)
+    if usage:
+        meta["usage_metadata"] = str(usage)
+    return meta
+
+
+def _finish_reason_indicates_incomplete(finish_reason: str) -> bool:
+    tokens = ("MAX", "TOKEN", "INCOMPLETE", "LENGTH", "RECITATION")
+    upper = (finish_reason or "").upper()
+    return any(tok in upper for tok in tokens)
+
+
+def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, str]:
+    payload = (txt or "").rstrip()
+    if not payload:
+        return True, "empty payload"
+
+    extracted = _extract_json_array_text(payload)
+    if not extracted or "]" not in extracted or not extracted.endswith("]"):
+        return True, "missing closing ]"
+
+    quote_count = 0
+    escaped = False
+    for ch in extracted:
+        if escaped:
+            escaped = False
             continue
-        try:
-            top = json.loads(candidate)
-            break
-        except json.JSONDecodeError as err:
-            parse_attempts.append(f"{label}:{err}")
-    else:
-        preview = extracted[:300].replace("\n", "\\n")
-        raise ValueError(f"LLM ID-array parse failed ({'; '.join(parse_attempts)}) preview={preview}")
+        if ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quote_count += 1
+    if quote_count % 2 == 1:
+        return True, "payload ends mid-string"
 
-    if not isinstance(top, list):
-        raise ValueError(f"LLM ID-array parse failed: expected list, got {type(top).__name__}")
-
-    allowed = {it["id"] for it in items}
-    out_ids = []
-    seen = set()
-    for row in top:
-        if isinstance(row, str) and row in allowed and row not in seen:
-            out_ids.append(row)
-            seen.add(row)
-        if len(out_ids) >= min(5, len(items)):
-            break
-    return out_ids
-
-
-def _rank_defaults_from_item(item: dict) -> dict:
-    """Build deterministic digest fields when model returns IDs only."""
-    domain = (item.get("from_domain") or "").lower()
-    subject = (item.get("subject") or "").lower()
-
-    is_gov = domain.endswith(".gov") or ".gov." in domain or any(k in domain for k in ["gov", "iras", "mom", "cpf", "ica"])
-    is_security = bool(item.get("otp_like")) or "security" in subject or "password" in subject
-    is_billing = bool(item.get("has_deadline_word")) or bool(item.get("billing_cue"))
-
-    category = "Other"
-    if is_security:
-        category = "Security"
-    elif is_gov:
-        category = "Government"
-    elif is_billing:
-        category = "Billing"
-    elif item.get("txn_alert"):
-        category = "Transaction"
-    elif item.get("is_social"):
-        category = "Social"
-
-    urgency = "Low"
-    if is_security or is_billing:
-        urgency = "High"
-    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref") or item.get("txn_alert"):
-        urgency = "Medium"
-
-    msg_type = "FYI"
-    if urgency != "Low" or item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
-        msg_type = "Action"
-
-    why = "Prioritized by ranked ID and message signals."
-    if is_security:
-        why = "Contains security/account verification cues."
-    elif is_billing:
-        why = "Contains billing or payment deadline cues."
-    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
-        why = "Likely a direct response or booking-related update."
-    elif item.get("is_adv") or item.get("promo_like"):
-        why = "Marketing or promotional content; lower actionability."
-
-    action = "Review when convenient."
-    if is_security:
-        action = "Verify activity and act immediately if unexpected."
-    elif is_billing:
-        action = "Check due date and complete required payment/action."
-    elif item.get("is_reply") or item.get("booking_cue") or item.get("reservation_ref"):
-        action = "Review details and follow up if needed."
-
-    return {
-        "type": msg_type,
-        "category": category,
-        "urgency": urgency,
-        "why": why,
-        "action": action,
-    }
-
-
-def _rows_from_ranked_ids(ranked_ids: List[str], items: List[dict]) -> Tuple[List[dict], bool]:
-    """Convert ranked IDs to digest rows using deterministic defaults/heuristics."""
-    by_id = {it["id"]: it for it in items}
-    rows = []
-    used_defaults = False
-    for msg_id in ranked_ids[:min(5, len(items))]:
-        item = by_id.get(msg_id)
-        if not item:
-            continue
-        defaults = _rank_defaults_from_item(item)
-        used_defaults = True
-        rows.append({"id": msg_id, **defaults})
-    return rows, used_defaults
+    if _finish_reason_indicates_incomplete(finish_reason):
+        return True, f"finish_reason={finish_reason}"
+    return False, ""
 
 
 def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
@@ -893,35 +861,67 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
     model = GEMINI_MODEL
     backoff = BASE_BACKOFF
     max_retries = 3
+    last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
+        id_only_mode = attempt >= 1
+        max_output_tokens = 600 + (attempt * 100)
         try:
             gemini_model = genai.GenerativeModel(model)
             # Gemini uses a single prompt combining system and user messages
-            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            prompt_suffix = ""
+            if id_only_mode:
+                prompt_suffix = (
+                    "\n\nOutput-minimization mode: return JSON array ONLY with objects containing "
+                    "an `id` field from the provided items, e.g. [{\"id\":\"m1\"}]. "
+                    "No extra keys, no commentary."
+                )
+            full_prompt = f"{sys_prompt}\n\n{user_msg}{prompt_suffix}"
             response = gemini_model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=600,
+                    max_output_tokens=max_output_tokens,
                     response_mime_type="application/json",
                 )
             )
             txt = (response.text or "").strip()
-            ranked_ids = _parse_llm_id_array(txt, items)
-            out, used_defaults = _rows_from_ranked_ids(ranked_ids, items)
+            meta = _gemini_candidate_metadata(response)
+            finish_reason = meta.get("finish_reasons", meta.get("finish_reason", ""))
             print(
-                f"[LLM] Gemini model={model} parsed_valid_ids={len(ranked_ids)} "
-                f"ranking_items={len(out)} defaults_or_heuristics_applied={used_defaults}"
+                f"[LLM] Gemini metadata attempt={attempt + 1}/{max_retries} "
+                f"id_only_mode={id_only_mode} max_output_tokens={max_output_tokens} "
+                f"meta={meta}"
             )
+            truncated, reason = _looks_truncated_json_payload(txt, finish_reason)
+            if truncated:
+                last_err = GeminiTruncatedOutput(
+                    f"GeminiTruncatedOutput: likely incomplete output on attempt {attempt + 1}/{max_retries}; reason={reason}"
+                )
+                if attempt < max_retries - 1:
+                    print(f"[LLM] {last_err}. Retrying with reduced output requirements.")
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                raise last_err
+
+            out = _parse_llm_response(txt, items)
+            if out:
+                print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
+            else:
+                print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
             return out, model
         except Exception as e:
+            last_err = e
             print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    print(f"[LLM] Gemini model={model} total failure after {max_retries} attempts")
+    print(
+        f"[LLM] Gemini model={model} total failure after {max_retries} attempts: "
+        f"{type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}"
+    )
     return [], model
 
 
