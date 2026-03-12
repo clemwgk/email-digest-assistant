@@ -65,9 +65,8 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-# Default to Gemini 2.5 Flash, which is generally stronger than Flash-Lite
-# while still offering a free usage tier (rate-limited) in Google AI Studio.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Default to Gemini 2.5 Flash-Lite for better headroom on constrained/free-tier usage.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 BASE_BACKOFF = 2.0  # seconds
 
@@ -824,7 +823,7 @@ def _gemini_candidate_metadata(response) -> Dict[str, str]:
 
 
 def _finish_reason_indicates_incomplete(finish_reason: str) -> bool:
-    tokens = ("MAX", "TOKEN", "INCOMPLETE", "LENGTH", "RECITATION")
+    tokens = ("MAX", "MAX_TOKENS", "TOKEN", "INCOMPLETE", "LENGTH")
     upper = (finish_reason or "").upper()
     return any(tok in upper for tok in tokens)
 
