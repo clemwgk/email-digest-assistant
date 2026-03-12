@@ -806,6 +806,12 @@ def _gemini_candidate_metadata(response) -> Dict[str, str]:
     return meta
 
 
+def _finish_reason_indicates_incomplete(finish_reason: str) -> bool:
+    tokens = ("MAX", "TOKEN", "INCOMPLETE", "LENGTH", "RECITATION")
+    upper = (finish_reason or "").upper()
+    return any(tok in upper for tok in tokens)
+
+
 def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, str]:
     payload = (txt or "").rstrip()
     if not payload:
@@ -828,8 +834,7 @@ def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, s
     if quote_count % 2 == 1:
         return True, "payload ends mid-string"
 
-    finish_upper = (finish_reason or "").upper()
-    if any(tok in finish_upper for tok in ("MAX", "TOKEN", "INCOMPLETE", "LENGTH")):
+    if _finish_reason_indicates_incomplete(finish_reason):
         return True, f"finish_reason={finish_reason}"
     return False, ""
 
@@ -865,7 +870,7 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
             )
             txt = (response.text or "").strip()
             meta = _gemini_candidate_metadata(response)
-            finish_reason = meta.get("finish_reason", "")
+            finish_reason = meta.get("finish_reasons", meta.get("finish_reason", ""))
             print(
                 f"[LLM] Gemini metadata attempt={attempt + 1}/{max_retries} "
                 f"id_only_mode={id_only_mode} max_output_tokens={max_output_tokens} "
