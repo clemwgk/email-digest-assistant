@@ -20,7 +20,7 @@ jobs:
       # LLM Provider config (gemini or openai)
       LLM_PROVIDER: ${{ secrets.LLM_PROVIDER || 'gemini' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-2.5-flash' }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3.1-flash-lite-preview' }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
       EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
