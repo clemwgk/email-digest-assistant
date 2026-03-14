@@ -59,7 +59,7 @@ cp .env.example .env
 Then edit `.env` and set:
 - LLM_PROVIDER=gemini
 - GEMINI_API_KEY=...
-- GEMINI_MODEL=gemini-2.5-flash
+- GEMINI_MODEL=gemini-3.1-flash-lite-preview
 - EMAIL_USERNAME=your_gmail_address
 - EMAIL_APP_PASSWORD=your_gmail_app_password
 
@@ -137,7 +137,7 @@ on:
 | `DISABLE_DIGEST`  | (blank) | Set `1` to pause runs cleanly                                                        |
 | `DEBUG`           | (blank) | Set `1` for verbose logs (avoid in public repos)                                    |
 
-**Gemini default (free-tier friendly):** `gemini-2.5-flash` (override via `GEMINI_MODEL`)
+**Gemini default (free-tier friendly):** `gemini-3.1-flash-lite-preview` (override via `GEMINI_MODEL`)
 
 **OpenAI fallback** (with 4 retries + backoff):  
 `gpt-5-mini → gpt-5-nano → gpt-4.1-mini → gpt-4o-mini → gpt-3.5-turbo`
