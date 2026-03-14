@@ -65,8 +65,8 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-# Default to Gemini 2.5 Flash-Lite for better headroom on constrained/free-tier usage.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Default to Gemini 3.1 Flash-Lite preview for current free-tier preference.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 
 BASE_BACKOFF = 2.0  # seconds
 
@@ -751,34 +751,64 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
 
     allowed = {it["id"] for it in items}
     out = []
+    seen_ids = set()
+    row_type_counts = {"str": 0, "dict": 0, "other": 0, "invalid": 0}
+
     for row in top:
-        if isinstance(row, dict) and row.get("id") in allowed:
-            # Normalize all display fields to text (avoid html.escape crashes)
-            t_type = _as_text(row.get("type"))
-            t_cat  = _as_text(row.get("category"))
-            t_urg  = _as_text(row.get("urgency"))
-            t_why  = _as_text(row.get("why"))
-            t_act  = _as_text(row.get("action"))
-            # Debug if coercion happened
-            if DEBUG:
-                for k, v in (("type", row.get("type")), ("category", row.get("category")),
-                             ("urgency", row.get("urgency")), ("why", row.get("why")), ("action", row.get("action"))):
-                    if v is not None and not isinstance(v, str):
-                        debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
-            out.append({
-                "id": row["id"],
-                "type": t_type,
-                "category": t_cat,
-                "urgency": t_urg,
-                "why": t_why,
-                "action": t_act,
-            })
+        row_obj = None
+        if isinstance(row, str):
+            row_type_counts["str"] += 1
+            candidate_id = row
+        elif isinstance(row, dict):
+            row_type_counts["dict"] += 1
+            row_obj = row
+            candidate_id = row.get("id")
+        else:
+            row_type_counts["other"] += 1
+            row_type_counts["invalid"] += 1
+            continue
+
+        if candidate_id not in allowed or candidate_id in seen_ids:
+            row_type_counts["invalid"] += 1
+            continue
+
+        # Normalize all display fields to text (avoid html.escape crashes)
+        row_obj = row_obj or {}
+        t_type = _as_text(row_obj.get("type"))
+        t_cat  = _as_text(row_obj.get("category"))
+        t_urg  = _as_text(row_obj.get("urgency"))
+        t_why  = _as_text(row_obj.get("why"))
+        t_act  = _as_text(row_obj.get("action"))
+
+        # Debug if coercion happened (dict payloads only)
+        if DEBUG and row_obj:
+            for k, v in (("type", row_obj.get("type")), ("category", row_obj.get("category")),
+                         ("urgency", row_obj.get("urgency")), ("why", row_obj.get("why")), ("action", row_obj.get("action"))):
+                if v is not None and not isinstance(v, str):
+                    debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
+
+        out.append({
+            "id": candidate_id,
+            "type": t_type,
+            "category": t_cat,
+            "urgency": t_urg,
+            "why": t_why,
+            "action": t_act,
+        })
+        seen_ids.add(candidate_id)
+
         if len(out) >= 5:
             break
+
     # Validate: we should have min(5, len(items)) results
     expected = min(5, len(items))
     if len(out) < expected:
-        debug_print(f"[Rank] WARNING: Got {len(out)} results, expected {expected}. LLM returned {len(top)} items, {len(top) - len(out)} had invalid IDs.")
+        debug_print(
+            f"[Rank] WARNING: Got {len(out)} results, expected {expected}. "
+            f"LLM returned {len(top)} items; type_counts={row_type_counts}."
+        )
+    else:
+        debug_print(f"[Rank] Parsed response type_counts={row_type_counts}")
     return out
 
 
