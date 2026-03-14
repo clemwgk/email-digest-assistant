@@ -24,7 +24,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 from openai import OpenAI
-import google.generativeai as genai
+from google import genai
 
 # -----------------------------
 # Env & constants
@@ -76,8 +76,9 @@ if LLM_PROVIDER == "openai" or os.getenv("OPENAI_API_KEY"):
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Gemini client (initialized if needed)
+gemini_client = None
 if LLM_PROVIDER == "gemini" and os.getenv("GEMINI_API_KEY"):
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Tunables
 SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))
@@ -866,23 +867,12 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
         id_only_mode = attempt >= 1
         max_output_tokens = 600 + (attempt * 100)
         try:
-            gemini_model = genai.GenerativeModel(model)
             # Gemini uses a single prompt combining system and user messages
-            prompt_suffix = ""
-            if id_only_mode:
-                prompt_suffix = (
-                    "\n\nOutput-minimization mode: return JSON array ONLY with objects containing "
-                    "an `id` field from the provided items, e.g. [{\"id\":\"m1\"}]. "
-                    "No extra keys, no commentary."
-                )
-            full_prompt = f"{sys_prompt}\n\n{user_msg}{prompt_suffix}"
-            response = gemini_model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0,
-                    max_output_tokens=max_output_tokens,
-                    response_mime_type="application/json",
-                )
+            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            response = gemini_client.models.generate_content(
+                model=model,
+                contents=full_prompt,
+                config={"temperature": 0.1, "max_output_tokens": 600},
             )
             txt = (response.text or "").strip()
             meta = _gemini_candidate_metadata(response)
@@ -911,16 +901,12 @@ def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
                 print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
             return out, model
         except Exception as e:
-            last_err = e
-            print(f"[LLM] Gemini model={model} attempt={attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
+            print(f"[Rank:Gemini:{model}] attempt {attempt+1} error: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    print(
-        f"[LLM] Gemini model={model} total failure after {max_retries} attempts: "
-        f"{type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}"
-    )
+    print(f"[Rank:Gemini] total failure after {max_retries} attempts")
     return [], model
 
 
@@ -996,15 +982,15 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
 
     # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
-        if not has_gemini_key:
-            print("[LLM] Fallback to OpenAI because GEMINI_API_KEY is missing")
+        if not gemini_client:
+            print("[Rank] GEMINI_API_KEY not set, falling back to OpenAI")
         else:
             print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
             result, model = _llm_rank_gemini(feed, RANK_SYSTEM_GEMINI_IDS, gemini_user_msg, items)
             if result:  # Gemini succeeded
                 return result, model
             # Gemini failed, fall back to OpenAI
-            print("[LLM] Fallback to OpenAI because Gemini ranking failed")
+            print("[Rank] Gemini failed, falling back to OpenAI")
 
     # Use OpenAI (either as primary or fallback)
     if openai_client:
