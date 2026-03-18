@@ -65,8 +65,8 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-# Default to Gemini 2.5 Flash-Lite for better headroom on constrained/free-tier usage.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+# Default to Gemini 3.1 Flash-Lite preview for current free-tier preference.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 
 BASE_BACKOFF = 2.0  # seconds
 
@@ -675,23 +675,6 @@ id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_smal
 You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
 """
 
-RANK_SYSTEM_GEMINI_IDS = """You rank candidate emails into a Top-N ordered list of message IDs.
-
-Return ONLY a compact JSON array of strings, e.g. ["id1","id2","id3"].
-Do not return prose, markdown, comments, or any keys/objects.
-Only use IDs from the provided candidates. Keep order from highest to lowest priority.
-Return exactly min(5, number_of_candidates) unique IDs.
-
-Ranking guidance:
-- Action > FYI.
-- Legal/Gov/Billing outrank others.
-- Bills / payment due are important.
-- Social notifications last unless security/account risk.
-- Prefer replies and booking/reservation threads over newsletters/promos.
-- If is_adv=true or promo_like=true and no clear action/deadline, down-rank.
-- Neutral transaction alerts without billing words should be lower urgency.
-"""
-
 def _extract_json_array_text(txt: str) -> str:
     """Extract first JSON array from model text, handling markdown/code wrappers."""
     s = (txt or "").strip().replace("\ufeff", "")
@@ -751,34 +734,64 @@ def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
 
     allowed = {it["id"] for it in items}
     out = []
+    seen_ids = set()
+    row_type_counts = {"str": 0, "dict": 0, "other": 0, "invalid": 0}
+
     for row in top:
-        if isinstance(row, dict) and row.get("id") in allowed:
-            # Normalize all display fields to text (avoid html.escape crashes)
-            t_type = _as_text(row.get("type"))
-            t_cat  = _as_text(row.get("category"))
-            t_urg  = _as_text(row.get("urgency"))
-            t_why  = _as_text(row.get("why"))
-            t_act  = _as_text(row.get("action"))
-            # Debug if coercion happened
-            if DEBUG:
-                for k, v in (("type", row.get("type")), ("category", row.get("category")),
-                             ("urgency", row.get("urgency")), ("why", row.get("why")), ("action", row.get("action"))):
-                    if v is not None and not isinstance(v, str):
-                        debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
-            out.append({
-                "id": row["id"],
-                "type": t_type,
-                "category": t_cat,
-                "urgency": t_urg,
-                "why": t_why,
-                "action": t_act,
-            })
+        row_obj = None
+        if isinstance(row, str):
+            row_type_counts["str"] += 1
+            candidate_id = row
+        elif isinstance(row, dict):
+            row_type_counts["dict"] += 1
+            row_obj = row
+            candidate_id = row.get("id")
+        else:
+            row_type_counts["other"] += 1
+            row_type_counts["invalid"] += 1
+            continue
+
+        if candidate_id not in allowed or candidate_id in seen_ids:
+            row_type_counts["invalid"] += 1
+            continue
+
+        # Normalize all display fields to text (avoid html.escape crashes)
+        row_obj = row_obj or {}
+        t_type = _as_text(row_obj.get("type"))
+        t_cat  = _as_text(row_obj.get("category"))
+        t_urg  = _as_text(row_obj.get("urgency"))
+        t_why  = _as_text(row_obj.get("why"))
+        t_act  = _as_text(row_obj.get("action"))
+
+        # Debug if coercion happened (dict payloads only)
+        if DEBUG and row_obj:
+            for k, v in (("type", row_obj.get("type")), ("category", row_obj.get("category")),
+                         ("urgency", row_obj.get("urgency")), ("why", row_obj.get("why")), ("action", row_obj.get("action"))):
+                if v is not None and not isinstance(v, str):
+                    debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
+
+        out.append({
+            "id": candidate_id,
+            "type": t_type,
+            "category": t_cat,
+            "urgency": t_urg,
+            "why": t_why,
+            "action": t_act,
+        })
+        seen_ids.add(candidate_id)
+
         if len(out) >= 5:
             break
+
     # Validate: we should have min(5, len(items)) results
     expected = min(5, len(items))
     if len(out) < expected:
-        debug_print(f"[Rank] WARNING: Got {len(out)} results, expected {expected}. LLM returned {len(top)} items, {len(top) - len(out)} had invalid IDs.")
+        debug_print(
+            f"[Rank] WARNING: Got {len(out)} results, expected {expected}. "
+            f"LLM returned {len(top)} items; type_counts={row_type_counts}."
+        )
+    else:
+        debug_print(f"[Rank] Parsed response type_counts={row_type_counts}")
     return out
 
 
@@ -978,7 +991,6 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
 
     user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
     sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
-    gemini_user_msg = "Rank the following candidate emails and return only ordered IDs.\n\n" + json.dumps(feed, ensure_ascii=False)
 
     # Try Gemini first if configured
     if LLM_PROVIDER == "gemini":
@@ -986,7 +998,7 @@ def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
             print("[Rank] GEMINI_API_KEY not set, falling back to OpenAI")
         else:
             print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
-            result, model = _llm_rank_gemini(feed, RANK_SYSTEM_GEMINI_IDS, gemini_user_msg, items)
+            result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
             if result:  # Gemini succeeded
                 return result, model
             # Gemini failed, fall back to OpenAI
@@ -1011,6 +1023,26 @@ def _titlecase_or(raw: Optional[str], fallback: str) -> str:
     s = (raw or "").strip()
     return s[:1].upper() + s[1:] if s else fallback
 
+def _display_why(row: dict, item: dict) -> str:
+    why = _as_text((row or {}).get("why")).strip()
+    if why:
+        return why
+
+    it = item or {}
+    if it.get("has_deadline_word") or it.get("billing_cue"):
+        return "Contains billing/deadline cues that may require action."
+    if it.get("txn_alert") and not it.get("txn_small"):
+        return "Transaction alert above threshold; review for unexpected charges."
+    if it.get("txn_alert"):
+        return "Transaction alert detected; included for monitoring."
+    if it.get("is_reply") or it.get("booking_cue") or it.get("reservation_ref"):
+        return "Reply or booking context suggests a likely follow-up action."
+    if it.get("is_social"):
+        return "Social/account notification; generally lower urgency."
+    if it.get("is_adv") or it.get("promo_like"):
+        return "Promotional content ranked lower than action-oriented emails."
+    return "Ranked as one of the most relevant messages in the selected window."
+
 def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int, used_model: str) -> Tuple[str,str]:
     ws = datetime.datetime.fromtimestamp(window_start, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
     we = datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
@@ -1032,7 +1064,7 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
             it = by_id.get(row["id"], {})
             subj = it.get("subject", "(no subject)")
             frm = it.get("from_raw") or it.get("from_friendly") or it.get("from_domain")
-            why = _as_text(row.get("why"))
+            why = _display_why(row, it)
             act = _as_text(row.get("action"))
             urg = _as_text(row.get("urgency")) or "Low"
             cat = _as_text(row.get("category")) or "Other"
@@ -1070,7 +1102,7 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
             dom = html.escape(it.get("from_domain", "") or "")
             domain_link = f"<a href='https://{dom}' style='color:#2563eb;text-decoration:none'>{dom}</a>" if dom else ""
             snip = html.escape((it.get("snippet") or "").strip())
-            why = html.escape(_as_text(row.get("why")))
+            why = html.escape(_display_why(row, it))
             act = html.escape(_as_text(row.get("action")))
             # Normalize badge labels closer to old look
             cat = _titlecase_or(_as_text(row.get("category")), "Other")
