@@ -65,8 +65,7 @@ OPENAI_MODEL_CANDIDATES = [
 ]
 
 # Gemini model (single model, no fallback needed for free tier)
-# Default to Gemini 3.1 Flash-Lite preview for current free-tier preference.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 BASE_BACKOFF = 2.0  # seconds
 
