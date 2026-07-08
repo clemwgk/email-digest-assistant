@@ -462,8 +462,9 @@ DECISION PROCEDURE, per email:
    exception is the credit-card-statement override written in the rubric itself.
 3. Otherwise test it against ACT, then KNOW. Include only if it clearly fits. When genuinely
    unsure, exclude: a missed marginal item costs less than restored noise.
-4. Sender identity is decided at full-address level. nateszerotoai@substack.com is allowlisted;
-   a different mailbox at substack.com is not.
+4. Sender identity is decided at full-address level, not by domain. Only the exact addresses the
+   rubric allowlists qualify — e.g. Nate's nateszerotoai@substack.com AND natesnewsletter@substack.com
+   are both allowlisted; a different mailbox at substack.com (another author, or a platform no-reply) is not.
 
 TRANSACTION RULE (this replaced a regex that kept failing — be precise):
 An amount is a transaction only if the email reports money actually moving out of Clement's
