@@ -4,3 +4,4 @@ google-auth-oauthlib
 google-genai
 python-dotenv
 openai
+pytest  # dev/test only

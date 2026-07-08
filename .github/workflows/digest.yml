@@ -3,7 +3,12 @@ name: Email Digest (Daily)
 on:
   schedule:
     - cron: "17 0 * * *"   # 08:17 Asia/Singapore (UTC+8)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: render digest + print decisions, skip SMTP send and watermark write"
+        type: boolean
+        default: false
 
 concurrency:
   group: email-digest
@@ -17,6 +22,8 @@ jobs:
       GOOGLE_TOKEN_JSON_B64: ${{ secrets.GMAIL_TOKEN_JSON_B64 }}
       DISABLE_DIGEST: ${{ secrets.DISABLE_DIGEST || '' }}
       DEBUG: ${{ secrets.DEBUG || '' }}
+      # Phase 6: dry-run dispatch input → DRY_RUN env (renders + prints, skips SMTP + watermark)
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
       # LLM Provider config (gemini or openai)
       LLM_PROVIDER: ${{ secrets.LLM_PROVIDER || 'gemini' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

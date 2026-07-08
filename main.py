@@ -1,4 +1,4 @@
-# main.py — Gmail AI Email Digest
+# main.py — Gmail AI Email Digest (rubric-judge redesign)
 
 import os
 import time
@@ -9,7 +9,7 @@ import base64
 import smtplib
 import traceback
 import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, NamedTuple
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -37,12 +37,22 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 OAUTH_B64 = os.getenv("GOOGLE_OAUTH_JSON_B64") or os.getenv("GMAIL_CREDENTIALS_JSON_B64") or ""
 TOKEN_B64 = os.getenv("GOOGLE_TOKEN_JSON_B64") or os.getenv("GMAIL_TOKEN_JSON_B64") or ""
 
-ISSUER_DOMAINS = [d.strip().lower() for d in os.getenv("ISSUER_DOMAINS", "").split(",") if d.strip()]
 STRICT_INBOX = os.getenv("STRICT_INBOX", "0").strip() == "1"
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Asia/Singapore")
 DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)
 DEBUG = os.getenv("DEBUG", "0").strip() == "1"
 DISABLE_DIGEST = os.getenv("DISABLE_DIGEST", "0").strip() == "1"
+
+# Dry run: run the full pipeline but print the rendered digest + decisions to the
+# log instead of sending SMTP / writing the watermark. Wired to the workflow's
+# `dry_run` dispatch input (Phase 6).
+DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
+
+# Cross-digest dedup: by default suppressed IDs are removed from KNOW candidacy
+# only; ACT items may resurface (Clement's Gate 2 decision — he sometimes misses
+# a digest and the short pool window bounds repetition). Flip to "1" for uniform
+# suppression. See design notes / DEDUP_SUPPRESS_ACT.
+DEDUP_SUPPRESS_ACT = os.getenv("DEDUP_SUPPRESS_ACT", "0").strip() == "1"
 
 # SMTP config (auto-detect 465 vs 587)
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -80,10 +90,28 @@ if LLM_PROVIDER == "gemini" and os.getenv("GEMINI_API_KEY"):
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Tunables
-SNIPPET_LEN = int(os.getenv("SNIPPET_LEN", "500"))
-TXN_ALERT_MIN = float(os.getenv("TXN_ALERT_MIN", "100"))
-TXN_HIGH_ALERT_MIN = float(os.getenv("TXN_HIGH_ALERT_MIN", "100"))
+LLM_BODY_LEN = int(os.getenv("LLM_BODY_LEN", "2000"))   # masked chars sent to the judge
+PREVIEW_LEN = int(os.getenv("PREVIEW_LEN", "200"))      # masked chars shown in the card
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "2000"))
 SINCE_BUFFER_HOURS = int(os.getenv("SINCE_BUFFER_HOURS", "6"))
+RUBRIC_PATH = os.getenv("RUBRIC_PATH", "rubric.md")
+
+# Selection budget
+TOTAL_BUDGET = 7
+KNOW_CAP = 3
+
+# -----------------------------
+# Errors
+# -----------------------------
+class RubricError(RuntimeError):
+    """Raised when rubric.md is missing or empty — never run rubric-less."""
+
+
+class LLMExhaustedError(RuntimeError):
+    """Raised when every configured LLM provider failed to produce a parseable
+    judgment. Propagates to main() → error email + failed run. A genuinely empty
+    (but successfully parsed) judgment is NOT this error."""
+
 
 # -----------------------------
 # Utils
@@ -154,7 +182,7 @@ def _html_to_text(s: str) -> str:
     s = re.sub(r'(?is)<.*?>', ' ', s)
     s = html.unescape(s)
     # remove zero-width chars like &zwnj;
-    s = s.replace("\u200c", "").replace("\u200b", "")
+    s = s.replace("‌", "").replace("​", "")
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
 
@@ -197,11 +225,28 @@ def _extract_full_body_text(msg) -> str:
     return _post_process_text("")
 
 # -----------------------------
-# OTP/2FA detection — mask (do not drop)
+# OTP/2FA detection — narrowed mask (do not drop)
+#
+# The mask's job is privacy: never transmit a live-looking verification code.
+# Relevance (OTP emails are categorically noise) is now the rubric/LLM's job.
+# Narrowed vs. the old mask: only tokens that CONTAIN A DIGIT (length 4–8),
+# sitting within an OTP-keyword window, are masked — so marketing/transaction
+# text with plain uppercase words ("VISA", "REVOLUTION", "CODE") survives.
 # -----------------------------
 OTP_KEYWORDS_RE = re.compile(r'(?i)\b(otp|one[- ]?time password|verification code|2fa|login code|security code)\b')
-OTP_CODE_RE = re.compile(r'(?i)(?<![A-Z0-9])([A-Z0-9]{4,8})(?![A-Z0-9])')
+# A 4–8 char alphanumeric token, bounded by non-alnum. Digit-bearing check is
+# applied in code (see _token_is_code) so only codes — not plain words — match.
+OTP_TOKEN_RE = re.compile(r'(?<![A-Za-z0-9])([A-Za-z0-9]{4,8})(?![A-Za-z0-9])')
 OTP_NEG_CUE_RE = re.compile(r'(?i)(do not share|never (?:ask|request)|we will never (?:ask|request)|stay secure|for your security|phishing|scam)')
+
+def _token_is_code(tok: str) -> bool:
+    return any(ch.isdigit() for ch in tok)
+
+def _has_code_token(s: str) -> bool:
+    return any(_token_is_code(m.group(1)) for m in OTP_TOKEN_RE.finditer(s or ""))
+
+def _mask_codes(s: str) -> str:
+    return OTP_TOKEN_RE.sub(lambda m: "‹code›" if _token_is_code(m.group(1)) else m.group(1), s or "")
 
 def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bool, str, str]:
     text = (subject or "") + "\n" + (body or "")
@@ -212,232 +257,13 @@ def classify_and_mask_otp(subject: str, body: str, window: int = 80) -> Tuple[bo
         window_text = text[left:right]
         if OTP_NEG_CUE_RE.search(window_text):
             continue
-        if OTP_CODE_RE.search(window_text):
+        if _has_code_token(window_text):
             otp_like = True
             break
     if not otp_like:
         return False, subject, body
 
-    def _mask(s: str) -> str:
-        return OTP_CODE_RE.sub("‹code›", s or "")
-
-    return True, _mask(subject), _mask(body)
-
-# -----------------------------
-# Amount parsing & context (with refined heuristics)
-# -----------------------------
-AMOUNT_CURR_RE = re.compile(r'(?i)\b(SGD|USD|EUR|GBP|\$)\s?([0-9]{1,3}(?:[,\s][0-9]{3})*|[0-9]+)(\.[0-9]{2})?\b')
-AMOUNT_SIMPLE_RE = re.compile(r'(?<![0-9])([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(\.[0-9]{2})\b')
-
-# Tightened: no bare "transaction" token
-_NEAR_TXN_RE = re.compile(r'(?i)\b(transaction alert|charged|debited|purchase(?:d)?|withdrawal|transfer(?:red)?|authorized|unauthorized|declined|failed|credited|you(?:’|\'|)ve received|you received)\b')
-_NEUTRAL_TXN_RE = re.compile(r'(?i)\b(transaction alert|transfer status|funds transfer|fund transfer)\b')
-_BILLING_CUE_RE = re.compile(r'(?i)\b(invoice|payment due|bill(?:ing)? statement|pay by|due on|outstanding balance|amount due)\b')
-_BOOKING_CUE_RE = re.compile(r'(?i)\b(reservation|booking|check[- ]?in|check[- ]?out|confirmation|hotel|guest|stay|inquiry|question|request)\b')
-_RESERVATION_REF_RE = re.compile(
-    r"(?ix)\b("  # case-insensitive, verbose
-    r"reservation|booking|confirmation|itinerary|record\s+locator|pnr|ticket"
-    r")\s*(?:no\.?|\#|num(?:ber)?|code|id|reference|ref|:)?\s*([A-Z0-9]{5,12})\b"
-)
-_MEMBERSHIP_WORD_RE = re.compile(r'(?i)\b(membership|member|loyalty|rewards?|points|club|tier)\b')
-
-# Hard negatives near amount (coverage/insurance/limits)
-_NEAR_NEG_RE = re.compile(
-    r"(?i)\b("
-    r"coverage|cover|sum insured|insured|insurance|deposit insurance|scheme|by law|"
-    r"up to|maximum|max\.?|cap|capped|limit(?:ed)? to|per depositor|per account|"
-    r"policy|premium"
-    r")\b"
-)
-
-# Soft negatives: promo/T&C — scoring only
-_SOFT_NEG_SCORE_RE = re.compile(
-    r"(?i)\b(terms and conditions|tnc|for full terms|promotion|promo|offer|voucher|promo code|unsubscribe|manage preferences)\b"
-)
-
-CAP_WORDS = re.compile(
-    r"(?i)\b(up to|maximum|max\.?|cap|capped|limit(?:ed)? to|coverage|insured|insurance|deposit insurance|per depositor|per account|scheme|by law)\b"
-)
-
-def _money_from_groups(cur: Optional[str], num: Optional[str], cents: Optional[str]) -> Optional[Tuple[str, float]]:
-    if num is None:
-        return None
-    n = num.replace(",", "").replace(" ", "")
-    try:
-        val = float(n + (cents or ""))
-    except Exception:
-        return None
-    if cur is None or cur == "$":
-        cur = "SGD"
-    return (cur, val)
-
-def _parse_amounts_from_text(text: str) -> List[Tuple[str,float,Tuple[int,int]]]:
-    out = []
-    for m in AMOUNT_CURR_RE.finditer(text):
-        cur, amt = _money_from_groups(m.group(1), m.group(2), m.group(3))
-        if cur and amt is not None:
-            out.append((cur, amt, (m.start(), m.end())))
-    for m in AMOUNT_SIMPLE_RE.finditer(text):
-        try:
-            amt = float(m.group(1).replace(",", "") + m.group(2))
-            out.append(("SGD", amt, (m.start(), m.end())))
-        except Exception:
-            pass
-    return out
-
-def _window_has(regex: re.Pattern, text: str, span: Tuple[int,int], win: int) -> bool:
-    a, b = span
-    left = max(0, a - win); right = min(len(text), b + win)
-    return bool(regex.search(text[left:right]))
-
-def _best_amount_by_context(text: str, cands: List[Tuple[str,float,Tuple[int,int]]], is_issuer: bool) -> Optional[Tuple[str,float,Tuple[int,int]]]:
-    """
-    Score amounts by nearby context:
-      +3 if txn verb within ~80 chars
-      -3 if hard negative within ~60 chars (coverage/insurance/limits)
-      -1.5 if soft-negative within ~80 chars (T&C, promo, etc.)
-      +1 if issuer domain
-      + tiny tie-break for larger amount
-    """
-    if not cands:
-        return None
-
-    text_lower = text.lower()
-
-    def nearest_dist(regex: re.Pattern, pos: int) -> int:
-        best = 10**9
-        for m in regex.finditer(text_lower):
-            d = abs(m.start() - pos)
-            if d < best:
-                best = d
-        return best
-
-    best_score = -10**9
-    best = None
-    for (cur, amt, (a,b)) in cands:
-        center = (a + b) // 2
-        d_txn = nearest_dist(_NEAR_TXN_RE, center)
-        d_neg = nearest_dist(_NEAR_NEG_RE, center)
-        d_soft = nearest_dist(_SOFT_NEG_SCORE_RE, center)
-        score = 0.0
-        if d_txn <= 80: score += 3
-        if d_neg <= 60: score -= 3
-        if d_soft <= 80: score -= 1.5
-        billing_near = _window_has(_BILLING_CUE_RE, text, (a,b), win=120)
-        neutral_txn_near = _window_has(_NEUTRAL_TXN_RE, text, (a,b), win=140)
-        if neutral_txn_near and not billing_near:
-            score -= 2.5
-        if is_issuer: score += 1
-        score += min(amt, 1000) / 100000.0
-        if score > best_score:
-            best_score = score
-            best = (cur, amt, (a,b))
-    return best
-
-# -----------------------------
-# Snippet extraction (amount-/action-aware)
-# -----------------------------
-SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
-
-def _extract_window(text: str, center: int, radius: int = 220) -> str:
-    a = max(0, center - radius)
-    b = min(len(text), center + radius)
-    seg = text[a:b]
-    seg = re.sub(r'\s+', ' ', seg).strip()
-    return seg
-
-def _extract_smart_snippet_v2(full_text: str, max_len: int, preferred_span: Optional[Tuple[int,int]]) -> str:
-    if not full_text:
-        return "[Could not extract body]"
-    if preferred_span:
-        center = (preferred_span[0] + preferred_span[1]) // 2
-        win = _extract_window(full_text, center)
-        return win[:max_len]
-    sentences = SENT_SPLIT.split(full_text)
-    scored = []
-    for s in sentences:
-        score = 0
-        if _NEAR_TXN_RE.search(s): score += 2
-        if _BILLING_CUE_RE.search(s) and not _NEUTRAL_TXN_RE.search(s): score += 1.5
-        if re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', s): score += 1
-        if _BOOKING_CUE_RE.search(s): score += 1
-        if _has_reservation_reference(s): score += 1.5
-        if AMOUNT_CURR_RE.search(s): score += 1
-        if score: scored.append((score, s.strip()))
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return re.sub(r'\s+', ' ', scored[0][1])[:max_len]
-    return re.sub(r'\s+', ' ', full_text)[:max_len]
-
-# -----------------------------
-# Promo tagging for ranking fixes (A)
-# -----------------------------
-PROMO_NEAR_AMOUNT = re.compile(
-    r"(?i)\b(spend (?:a )?minimum|stand a chance to win|giveaway|voucher|flash deal|rebate|bonus miles|rsvp|t&cs apply|terms and conditions apply)\b"
-)
-
-def looks_adv(subject: str) -> bool:
-    return (subject or "").strip().upper().startswith("<ADV>")
-
-def promo_like_near_amount(text: str, span: Optional[Tuple[int,int]], win: int = 120) -> bool:
-    if not span:
-        return False
-    a, b = span
-    left = max(0, a - win); right = min(len(text), b + win)
-    return bool(PROMO_NEAR_AMOUNT.search(text[left:right]))
-
-# -----------------------------
-# Social / billing / booking cues
-# -----------------------------
-SOCIAL_DOMAINS = {
-    "linkedin.com",
-    "notifications.linkedin.com",
-    "facebookmail.com",
-    "messenger.com",
-}
-SOCIAL_KEYWORDS_RE = re.compile(r'(?i)\b(connection|invitation|profile|endorsed|people (?:viewed|are viewing)|add you|join my network)\b')
-
-def _is_social_notification(from_domain: str, subject: str, snippet: str) -> bool:
-    domain = (from_domain or "").lower()
-    if any(domain.endswith(d) for d in SOCIAL_DOMAINS):
-        return True
-    text = f"{subject}\n{snippet}"
-    return bool(SOCIAL_KEYWORDS_RE.search(text))
-
-def _sanitize_snippet_for_social(snippet: str) -> str:
-    if not snippet:
-        return snippet
-    # Collapse bio-like separators early
-    cleaned = re.split(r"\s*[•·|]\s*", snippet, maxsplit=1)[0]
-    cleaned = re.sub(r"(?i)\b(viewed your profile|see who|people you may know).*", "", cleaned).strip()
-    return cleaned or snippet
-
-def _has_billing_cue(text: str, span: Optional[Tuple[int,int]]) -> bool:
-    if span:
-        billing_near = _window_has(_BILLING_CUE_RE, text, span, win=140)
-        neutral_txn_near = _window_has(_NEUTRAL_TXN_RE, text, span, win=140)
-        return bool(billing_near and not neutral_txn_near)
-    return bool(_BILLING_CUE_RE.search(text))
-
-def _is_reply_email(headers: dict, subject: str) -> bool:
-    subj = (subject or "").lstrip()
-    if subj.lower().startswith("re:"):
-        return True
-    return bool(headers.get("in-reply-to") or headers.get("references"))
-
-def _has_booking_cue(text: str) -> bool:
-    return bool(_BOOKING_CUE_RE.search(text))
-
-def _has_reservation_reference(text: str) -> bool:
-    for m in _RESERVATION_REF_RE.finditer(text):
-        # Ignore matches that are clearly tied to memberships/loyalty programs (marketing heavy)
-        left = max(0, m.start() - 48)
-        right = min(len(text), m.end() + 48)
-        ctx = text[left:right]
-        if _MEMBERSHIP_WORD_RE.search(ctx):
-            continue
-        return True
-    return False
+    return True, _mask_codes(subject), _mask_codes(body)
 
 # -----------------------------
 # Gmail superset fetch + local filter
@@ -502,15 +328,21 @@ def _get_messages_full(service, ids: List[str]) -> List[Dict]:
         res.append(msg)
     return res
 
-def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN):
+# Deadline cue — used only as a thread-dedup tiebreak (keep an older message in a
+# thread if it carries a deadline the newest one dropped). NOT fed to the judge.
+DEADLINE_RE = re.compile(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b')
+
+def _item_has_deadline(it: dict) -> bool:
+    return bool(DEADLINE_RE.search((it.get('subject', '') or '') + ' ' + (it.get('body_for_llm', '') or '')))
+
+def fetch_all_since_v2(service, since_unix: int):
     """
     Build pool since watermark:
       - Superset Gmail query (3d; 7d fallback) + local filter internalDate >= since_unix
       - Include archived mail by default; exclude spam/trash; exclude past digests; exclude Sent/from:me
-      - OTP/code masking (do not drop)
+      - OTP/code masking (narrowed; do not drop)
       - Thread de-dup (keep latest; keep older w/ deadline words)
-      - Amount parsing + context → amount-centered snippet → txn flag
-      - Tagging for ranking fixes: is_adv, promo_like
+      - Per item: masked body_for_llm (~LLM_BODY_LEN) + body_preview (~PREVIEW_LEN of the SAME text)
     """
     q3 = _build_superset_query(3, STRICT_INBOX)
     debug_print(f"gmail.superset.query(primary) = {q3}")
@@ -540,7 +372,8 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         headers = _extract_headers(msg)
         sender_hdr = _get_header(headers, "from")
         display_name, addr = parseaddr(sender_hdr)
-        friendly_from = sender_hdr if display_name else (display_name or addr)
+        from_address = (addr or "").strip().lower()
+        from_name = (display_name or "").strip() or from_address
 
         subject = _get_header(headers, "subject")
         try:
@@ -551,74 +384,26 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
 
         full_body = _extract_full_body_text(msg)
 
-        # OTP masking
-        otp_like, subject, full_body = classify_and_mask_otp(subject, full_body)
+        # OTP masking (narrowed) — both body_for_llm and body_preview derive from
+        # the SAME masked string so the prompt and the card never disagree.
+        otp_like, subject, masked_body = classify_and_mask_otp(subject, full_body)
         if otp_like:
             # Avoid leaking subjects (PII) into logs; note only the message id.
             debug_print(f"[OTP] masked codes for id={msg.get('id')}")
 
-        # From domain
-        from_domain = (addr.split('@')[-1].lower() if addr else (sender_hdr or "").lower()).strip()
-        is_issuer = any(from_domain.endswith(x) for x in ISSUER_DOMAINS)
-
-        # Amounts + best by context
-        cands = _parse_amounts_from_text(full_body)
-        best = _best_amount_by_context(full_body, cands, is_issuer)
-        parsed_cur = best[0] if best else None
-        parsed_amt = best[1] if best else None
-        amount_span = best[2] if best else None
-
-        # Refined is_txn logic
-        is_txn = False
-        if best:
-            center_near_txn = _window_has(_NEAR_TXN_RE, full_body, amount_span, win=120)
-            center_near_neg  = _window_has(_NEAR_NEG_RE, full_body, amount_span, win=80)
-            cap_near = _window_has(CAP_WORDS, full_body, amount_span, win=60)
-            is_txn = bool(center_near_txn and not center_near_neg and not cap_near)
-
-        billing_cue = _has_billing_cue(full_body, amount_span)
-
-        # Tag for ranking fixes (A)
-        is_adv = looks_adv(subject)
-        promo_near = promo_like_near_amount(full_body, amount_span)
-
-        small = None
-        if parsed_cur and parsed_amt is not None:
-            small = (parsed_cur == "SGD" and parsed_amt < TXN_ALERT_MIN)
-
-        snippet = _extract_smart_snippet_v2(f"{subject}\n{full_body}", snippet_len, amount_span)
-        is_social = _is_social_notification(from_domain, subject, snippet)
-        if is_social:
-            snippet = _sanitize_snippet_for_social(snippet)
-
-        is_reply = _is_reply_email(headers, subject)
-        booking_text = f"{subject}\n{full_body}"
-        booking_cue = _has_booking_cue(booking_text)
-        reservation_ref = _has_reservation_reference(booking_text)
+        from_domain = (from_address.split('@')[-1] if from_address else (sender_hdr or "").lower()).strip()
 
         item = {
             'id': msg.get('id'),
             'threadId': thread_id,
             'timestamp': ts,
+            'from_name': from_name,
+            'from_address': from_address,
             'from_domain': from_domain,
-            'from_raw': sender_hdr,            # "Name <email>"
-            'from_friendly': friendly_from,    # readable
+            'from_raw': sender_hdr,             # "Name <email>" — appendix/card display
             'subject': subject,
-            'snippet': snippet,
-            'has_deadline_word': bool(re.search(r'(?i)\b(due|deadline|expire|expiry|renew|invoice|pay by|payment due|statement)\b', (subject + ' ' + full_body))),
-            'txn_alert': bool(is_txn),
-            'txn_currency': parsed_cur,
-            'txn_amount': parsed_amt,
-            'txn_small': bool(small),
-            'otp_like': bool(otp_like),
-            'billing_cue': bool(billing_cue),
-            'is_social': bool(is_social),
-            'is_reply': bool(is_reply),
-            'booking_cue': bool(booking_cue),
-            'reservation_ref': bool(reservation_ref),
-            # New tags for ranking
-            'is_adv': bool(is_adv),
-            'promo_like': bool(promo_near),
+            'body_for_llm': (masked_body or "")[:LLM_BODY_LEN],
+            'body_preview': (masked_body or "")[:PREVIEW_LEN],
         }
         items.append(item)
 
@@ -630,7 +415,7 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
         if tid not in by_thread:
             by_thread[tid] = it
         else:
-            if it['has_deadline_word'] and not by_thread[tid]['has_deadline_word']:
+            if _item_has_deadline(it) and not _item_has_deadline(by_thread[tid]):
                 by_thread[tid] = it
     deduped = list(by_thread.values())
 
@@ -638,45 +423,111 @@ def fetch_all_since_v2(service, since_unix: int, snippet_len: int = SNIPPET_LEN)
     return deduped
 
 # -----------------------------
-# Ranking (LLM) with JSON-only selection
+# Rubric (Clement-owned judgment file)
 # -----------------------------
-RANK_SYSTEM = """You rank candidate emails into Top-5 JSON selections with strict ID-only.
+def load_rubric() -> str:
+    """Load rubric.md; missing or empty is a loud failure (never a rubric-less run)."""
+    try:
+        with open(RUBRIC_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except FileNotFoundError:
+        raise RubricError(f"Rubric file not found at '{RUBRIC_PATH}'. Refusing to run rubric-less.")
+    if not content:
+        raise RubricError(f"Rubric file '{RUBRIC_PATH}' is empty. Refusing to run rubric-less.")
+    return content
 
-IMPORTANT: You MUST return EXACTLY 5 items if there are 5 or more candidates.
-Only return fewer than 5 if the total number of candidates is less than 5.
-Every email has some relevance - your job is to RANK them, not filter them out.
+# -----------------------------
+# LLM judgment layer
+# -----------------------------
+SYSTEM_PROMPT = """You are the judgment layer of Clement's daily email digest. You receive his personal rubric and a
+JSON array of candidate emails from roughly the last day. Decide which emails he must ACT on and
+which he would materially want to KNOW about today — and exclude everything else. Returning zero
+items is a correct and common outcome: on a quiet day, an empty selection is a better answer than
+a padded one. Nothing is included just to fill space.
 
-Preferences (for ranking order):
-- Action > FYI.
-- Legal/Gov/Billing outrank others.
-- Bills / "payment due" are important.
-- Social notifications last.
-- When nothing critical, prefer newsletters over promos/marketing.
-- Direct replies to your inquiries or reservation/booking questions are important.
-- Do not treat plain transaction alerts/transfers as billing unless there is a billing cue or a deadline.
+THE CORE QUESTION, per email:
+Does Clement need to DO something about this (ACT)? Would he materially want to see it today even
+with nothing to do (KNOW)? Or neither (exclude)?
+When an email asks for action, ask WHOSE interest the action serves. "Pay your bill", "your
+flight changed", "confirm this login was you" are Clement's obligations — ACT. "Sign up",
+"redeem", "don't miss out", "claim your reward" are the sender's wishes — marketing; exclude it
+no matter how urgent the wording sounds.
 
-Rules to reduce noise (affects ranking, not exclusion):
-- Do NOT treat large amounts as important if txn_alert=false AND (is_adv=true OR promo_like=true).
-- If is_adv=true or promo_like=true, down-rank unless there is a clear action or deadline.
-- Do not mark category=Billing unless has_deadline_word=true OR billing_cue=true; neutral transaction alerts without billing words should be lower urgency.
-- Social/profile notifications (is_social=true) should be last unless they include security/account risk.
-- Prefer replies (is_reply=true) and booking_cue=true over newsletters and promos; when reservation_ref=true treat as more actionable than marketing/membership notices.
-- reservation_ref=true is only for reservation/confirmation codes (not membership IDs); use it to boost genuine booking threads.
-- In your "why", avoid citing "large amount mentioned" unless txn_alert=true.
+CLEMENT'S RUBRIC (his own definitions — these override your general intuitions):
+{RUBRIC_MD}
 
-Return ONLY a compact JSON array of objects:
-  {id, type, category, urgency, why, action}
-Only choose from provided IDs. Return exactly min(5, number_of_candidates) items.
-"""
+DECISION PROCEDURE, per email:
+1. Work out what the email actually is from its body text, not just its subject.
+2. Check the rubric's Noise list first. If it matches a noise category, exclude — the only
+   exception is the credit-card-statement override written in the rubric itself.
+3. Otherwise test it against ACT, then KNOW. Include only if it clearly fits. When genuinely
+   unsure, exclude: a missed marginal item costs less than restored noise.
+4. Sender identity is decided at full-address level. nateszerotoai@substack.com is allowlisted;
+   a different mailbox at substack.com is not.
 
-RANK_USER_TMPL = """You are given a list of emails with fields:
-id, subject, from_domain, snippet, txn_alert, txn_currency, txn_amount, txn_small, has_deadline_word, billing_cue, is_social, is_reply, booking_cue, reservation_ref, is_adv, promo_like.
-You MUST return EXACTLY 5 items (or all items if fewer than 5 candidates). Choose strictly from these IDs. Rank by actionability and legal/gov/billing. Down-rank promos/marketing (is_adv/promo_like) when non-transactional.
-"""
+TRANSACTION RULE (this replaced a regex that kept failing — be precise):
+An amount is a transaction only if the email reports money actually moving out of Clement's
+accounts: charged, debited, paid, transferred out, withdrawn. Amounts appearing in marketing
+offers, prices, insurance or deposit-coverage statements ("insured up to S$100,000"), credit
+limits, or promotional targets are NOT transactions. A genuine outflow of S$100 or more is ACT
+(fraud guardrail). Smaller outflows and micro-receipts are excluded.
 
-def _extract_json_array_text(txt: str) -> str:
-    """Extract first JSON array from model text, handling markdown/code wrappers."""
-    s = (txt or "").strip().replace("\ufeff", "")
+OUTPUT — return ONLY this JSON object, no commentary:
+{"items": [ ... ], "omitted_act_count": 0}
+Each item:
+  "id"       — copied exactly from the input; never invent or repeat an id
+  "tier"     — "ACT" or "KNOW"
+  "category" — one of: Billing, Government, Transaction, Travel, Security, Newsletter, Account, Other
+  "reason"   — one concrete sentence citing what in the email makes it signal
+  "action"   — one short imperative sentence; ACT items only, omit for KNOW
+  "amount"   — like "SGD 3103.00"; only when a genuine transaction amount is central, else omit
+
+BUDGET:
+At most 7 items total, ordered most-important-first. ACT items take priority; KNOW items fill at
+most 3 of the remaining slots. If more than 7 emails genuinely qualify as ACT, include the 7 most
+important and set omitted_act_count to the number left out; otherwise omitted_act_count is 0.
+
+FINAL RULES:
+- Reasons must be verifiable from the email text. Never cite an amount as significant unless the
+  transaction rule was satisfied.
+- OTP and verification-code emails are always excluded — their codes expired long before this
+  digest is read.
+- Do not pad. A short or empty list on a quiet day is the system working correctly."""
+
+# Structured-output schema (attempted first; falls back to plain generation).
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "tier": {"type": "string", "enum": ["ACT", "KNOW"]},
+                    "category": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "action": {"type": "string"},
+                    "amount": {"type": "string"},
+                },
+                "required": ["id", "tier", "category", "reason"],
+            },
+        },
+        "omitted_act_count": {"type": "integer"},
+    },
+    "required": ["items", "omitted_act_count"],
+}
+
+
+class ParsedJudgment(NamedTuple):
+    act: List[dict]
+    know: List[dict]
+    model_omitted: int
+
+
+def _extract_json_object_text(txt: str) -> str:
+    """Extract first balanced JSON object from model text, handling code fences."""
+    s = (txt or "").strip().replace("﻿", "")
     if s.startswith("```"):
         parts = s.split("```")
         if len(parts) >= 2:
@@ -684,7 +535,7 @@ def _extract_json_array_text(txt: str) -> str:
             if s.lower().startswith("json"):
                 s = s[4:].strip()
 
-    start = s.find("[")
+    start = s.find("{")
     if start == -1:
         return s
 
@@ -703,233 +554,159 @@ def _extract_json_array_text(txt: str) -> str:
         else:
             if ch == '"':
                 in_str = True
-            elif ch == "[":
+            elif ch == "{":
                 depth += 1
-            elif ch == "]":
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     return s[start:i+1]
-
     return s[start:]
 
 
-def _parse_llm_response(txt: str, items: List[dict]) -> List[dict]:
-    """Parse LLM JSON response and validate IDs."""
-    parse_attempts = []
-    raw = (txt or "").strip()
-    extracted = _extract_json_array_text(raw)
-
-    for label, candidate in (("raw", raw), ("extracted", extracted), ("sanitized", extracted.replace("\x00", ""))):
-        if not candidate:
+def _load_json_object(raw: str) -> dict:
+    attempts = []
+    for label, cand in (("raw", raw), ("extracted", _extract_json_object_text(raw))):
+        if not cand:
             continue
         try:
-            top = json.loads(candidate)
-            break
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+            attempts.append(f"{label}:not-an-object({type(obj).__name__})")
         except json.JSONDecodeError as err:
-            parse_attempts.append(f"{label}:{err}")
-    else:
-        preview = extracted[:300].replace("\n", "\\n")
-        raise ValueError(f"LLM JSON parse failed ({'; '.join(parse_attempts)}) preview={preview}")
+            attempts.append(f"{label}:{err}")
+    preview = (raw or "")[:300].replace("\n", "\\n")
+    raise ValueError(f"LLM JSON object parse failed ({'; '.join(attempts)}) preview={preview}")
 
-    allowed = {it["id"] for it in items}
-    out = []
-    seen_ids = set()
-    row_type_counts = {"str": 0, "dict": 0, "other": 0, "invalid": 0}
 
-    for row in top:
-        row_obj = None
-        if isinstance(row, str):
-            row_type_counts["str"] += 1
-            candidate_id = row
-        elif isinstance(row, dict):
-            row_type_counts["dict"] += 1
-            row_obj = row
-            candidate_id = row.get("id")
-        else:
-            row_type_counts["other"] += 1
-            row_type_counts["invalid"] += 1
+def _parse_llm_response(txt: str, allowed_ids: set) -> ParsedJudgment:
+    """Parse the judgment JSON object. Validates ids and tiers, splits into
+    ACT/KNOW preserving the model's order. A valid-but-empty result is legitimate.
+    Raises ValueError on unparseable / malformed output (caller decides retry)."""
+    obj = _load_json_object((txt or "").strip())
+
+    items_field = obj.get("items")
+    if not isinstance(items_field, list):
+        raise ValueError("LLM response object missing 'items' array")
+
+    model_omitted = obj.get("omitted_act_count", 0)
+    try:
+        model_omitted = max(0, int(model_omitted))
+    except (TypeError, ValueError):
+        model_omitted = 0
+
+    act: List[dict] = []
+    know: List[dict] = []
+    seen = set()
+    rejected = 0
+
+    for row in items_field:
+        if not isinstance(row, dict):
+            rejected += 1
             continue
-
-        if candidate_id not in allowed or candidate_id in seen_ids:
-            row_type_counts["invalid"] += 1
+        rid = row.get("id")
+        if rid not in allowed_ids or rid in seen:
+            rejected += 1
             continue
+        tier = _as_text(row.get("tier")).strip().upper()
+        if tier not in ("ACT", "KNOW"):
+            rejected += 1
+            continue
+        out_row = {
+            "id": rid,
+            "tier": tier,
+            "category": _as_text(row.get("category")).strip() or "Other",
+            "reason": _as_text(row.get("reason")).strip(),
+            "action": _as_text(row.get("action")).strip(),
+            "amount": _as_text(row.get("amount")).strip(),
+        }
+        seen.add(rid)
+        (act if tier == "ACT" else know).append(out_row)
 
-        # Normalize all display fields to text (avoid html.escape crashes)
-        row_obj = row_obj or {}
-        t_type = _as_text(row_obj.get("type"))
-        t_cat  = _as_text(row_obj.get("category"))
-        t_urg  = _as_text(row_obj.get("urgency"))
-        t_why  = _as_text(row_obj.get("why"))
-        t_act  = _as_text(row_obj.get("action"))
-
-        # Debug if coercion happened (dict payloads only)
-        if DEBUG and row_obj:
-            for k, v in (("type", row_obj.get("type")), ("category", row_obj.get("category")),
-                         ("urgency", row_obj.get("urgency")), ("why", row_obj.get("why")), ("action", row_obj.get("action"))):
-                if v is not None and not isinstance(v, str):
-                    debug_print(f"[Rank] non-string {k}; coerced to empty. value={v!r}")
-
-        out.append({
-            "id": candidate_id,
-            "type": t_type,
-            "category": t_cat,
-            "urgency": t_urg,
-            "why": t_why,
-            "action": t_act,
-        })
-        seen_ids.add(candidate_id)
-
-        if len(out) >= 5:
-            break
-
-    # Validate: we should have min(5, len(items)) results
-    expected = min(5, len(items))
-    if len(out) < expected:
-        debug_print(
-            f"[Rank] WARNING: Got {len(out)} results, expected {expected}. "
-            f"LLM returned {len(top)} items; type_counts={row_type_counts}."
-        )
-    else:
-        debug_print(f"[Rank] Parsed response type_counts={row_type_counts}")
-    return out
+    debug_print(f"[Judge] parsed act={len(act)} know={len(know)} rejected={rejected} model_omitted={model_omitted}")
+    return ParsedJudgment(act, know, model_omitted)
 
 
-class GeminiTruncatedOutput(RuntimeError):
-    """Raised when Gemini repeatedly returns incomplete/truncated JSON output."""
+def select_top(parsed: ParsedJudgment, suppressed_ids: Optional[set] = None,
+               suppress_act: bool = False, total: int = TOTAL_BUDGET,
+               know_cap: int = KNOW_CAP) -> Tuple[List[dict], int]:
+    """Apply cross-digest dedup suppression + selection budget.
+
+    ACT fills first (model's importance order); KNOW gets min(know_cap, total-#ACT)
+    of the remaining slots. Suppressed IDs are removed from KNOW candidacy by
+    default; ACT only when suppress_act. omitted_act_count counts model-reported
+    overflow PLUS any ACT rows truncated by the budget (not dedup-suppressed ones).
+    """
+    suppressed_ids = suppressed_ids or set()
+
+    act = parsed.act
+    if suppress_act and suppressed_ids:
+        act = [r for r in act if r["id"] not in suppressed_ids]
+    know = [r for r in parsed.know if r["id"] not in suppressed_ids]
+
+    act_selected = act[:total]
+    omitted = parsed.model_omitted + max(0, len(act) - len(act_selected))
+
+    know_slots = max(0, min(know_cap, total - len(act_selected)))
+    know_selected = know[:know_slots]
+
+    return act_selected + know_selected, omitted
 
 
-def _normalize_finish_reason(raw_finish) -> str:
-    """Best-effort extraction of finish reason label across SDK versions."""
-    if raw_finish is None:
-        return ""
-    name = getattr(raw_finish, "name", None)
-    if name:
-        return str(name)
-    text = str(raw_finish)
-    if "." in text:
-        return text.split(".")[-1]
-    return text
-
-
-def _gemini_candidate_metadata(response) -> Dict[str, str]:
-    """Extract candidate metadata for diagnostics without assuming SDK shape."""
-    meta: Dict[str, str] = {}
+def _gemini_finish_reason(response) -> str:
     candidates = getattr(response, "candidates", None) or []
-    finish_reasons = []
-    safety = []
     for cand in candidates:
-        finish = _normalize_finish_reason(getattr(cand, "finish_reason", None))
-        if finish:
-            finish_reasons.append(finish)
-        ratings = getattr(cand, "safety_ratings", None)
-        if ratings:
-            safety.append(str(ratings))
-    if finish_reasons:
-        meta["finish_reasons"] = ",".join(finish_reasons)
-        meta["finish_reason"] = finish_reasons[0]
-    if safety:
-        meta["safety_ratings"] = " | ".join(safety)
-    usage = getattr(response, "usage_metadata", None)
-    if usage:
-        meta["usage_metadata"] = str(usage)
-    return meta
+        finish = getattr(cand, "finish_reason", None)
+        if finish is not None:
+            name = getattr(finish, "name", None)
+            return str(name) if name else str(finish)
+    return ""
 
 
-def _finish_reason_indicates_incomplete(finish_reason: str) -> bool:
-    tokens = ("MAX", "MAX_TOKENS", "TOKEN", "INCOMPLETE", "LENGTH")
-    upper = (finish_reason or "").upper()
-    return any(tok in upper for tok in tokens)
-
-
-def _looks_truncated_json_payload(txt: str, finish_reason: str) -> Tuple[bool, str]:
-    payload = (txt or "").rstrip()
-    if not payload:
-        return True, "empty payload"
-
-    extracted = _extract_json_array_text(payload)
-    if not extracted or "]" not in extracted or not extracted.endswith("]"):
-        return True, "missing closing ]"
-
-    quote_count = 0
-    escaped = False
-    for ch in extracted:
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\":
-            escaped = True
-        elif ch == '"':
-            quote_count += 1
-    if quote_count % 2 == 1:
-        return True, "payload ends mid-string"
-
-    if _finish_reason_indicates_incomplete(finish_reason):
-        return True, f"finish_reason={finish_reason}"
-    return False, ""
-
-
-def _llm_rank_gemini(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
-    """Rank emails using Google Gemini API."""
+def _llm_rank_gemini(sys_prompt: str, user_msg: str, allowed_ids: set) -> Tuple[ParsedJudgment, str]:
+    """Judge with Gemini. Attempt structured output first, then plain generation.
+    Returns a parsed judgment (possibly empty) on success; raises LLMExhaustedError
+    after retries are exhausted."""
     model = GEMINI_MODEL
+    full_prompt = f"{sys_prompt}\n\n{user_msg}"
     backoff = BASE_BACKOFF
     max_retries = 3
     last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
-        id_only_mode = attempt >= 1
-        max_output_tokens = 600 + (attempt * 100)
+        use_schema = (attempt == 0)  # first try structured; fall back to plain on any error
         try:
-            # Gemini uses a single prompt combining system and user messages
-            full_prompt = f"{sys_prompt}\n\n{user_msg}"
+            config = {"temperature": 0.1, "max_output_tokens": LLM_MAX_OUTPUT_TOKENS}
+            if use_schema:
+                config["response_mime_type"] = "application/json"
+                config["response_schema"] = GEMINI_RESPONSE_SCHEMA
             response = gemini_client.models.generate_content(
-                model=model,
-                contents=full_prompt,
-                config={"temperature": 0.1, "max_output_tokens": 600},
+                model=model, contents=full_prompt, config=config,
             )
             txt = (response.text or "").strip()
-            meta = _gemini_candidate_metadata(response)
-            finish_reason = meta.get("finish_reasons", meta.get("finish_reason", ""))
-            print(
-                f"[LLM] Gemini metadata attempt={attempt + 1}/{max_retries} "
-                f"id_only_mode={id_only_mode} max_output_tokens={max_output_tokens} "
-                f"meta={meta}"
-            )
-            truncated, reason = _looks_truncated_json_payload(txt, finish_reason)
-            if truncated:
-                last_err = GeminiTruncatedOutput(
-                    f"GeminiTruncatedOutput: likely incomplete output on attempt {attempt + 1}/{max_retries}; reason={reason}"
-                )
-                if attempt < max_retries - 1:
-                    print(f"[LLM] {last_err}. Retrying with reduced output requirements.")
-                    time.sleep(backoff)
-                    backoff *= 2.0
-                    continue
-                raise last_err
-
-            out = _parse_llm_response(txt, items)
-            if out:
-                print(f"[LLM] Gemini model={model} produced {len(out)} ranking items")
-            else:
-                print(f"[LLM] Gemini model={model} returned 0 valid ranking items")
-            return out, model
+            finish = _gemini_finish_reason(response)
+            print(f"[LLM] Gemini attempt={attempt+1}/{max_retries} schema={use_schema} "
+                  f"finish={finish} chars={len(txt)}")
+            parsed = _parse_llm_response(txt, allowed_ids)
+            print(f"[LLM] Gemini model={model} judged act={len(parsed.act)} know={len(parsed.know)}")
+            return parsed, model
         except Exception as e:
-            print(f"[Rank:Gemini:{model}] attempt {attempt+1} error: {e}")
+            last_err = e
+            print(f"[Rank:Gemini:{model}] attempt {attempt+1} error: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(backoff)
                 backoff *= 2.0
 
-    print(f"[Rank:Gemini] total failure after {max_retries} attempts")
-    return [], model
+    raise LLMExhaustedError(f"Gemini failed after {max_retries} attempts: {type(last_err).__name__}: {last_err}")
 
 
-def _llm_rank_openai(feed: List[dict], sys_prompt: str, user_msg: str, items: List[dict]) -> Tuple[List[dict], str]:
-    """Rank emails using OpenAI API with model fallback."""
-    model_idx = 0
+def _llm_rank_openai(sys_prompt: str, user_msg: str, allowed_ids: set) -> Tuple[ParsedJudgment, str]:
+    """Judge with OpenAI (model fallback). Returns parsed judgment on success;
+    raises LLMExhaustedError if every candidate model failed."""
     backoff = BASE_BACKOFF
-    last_err = None
+    last_err: Optional[Exception] = None
 
-    while model_idx < len(OPENAI_MODEL_CANDIDATES):
-        model = OPENAI_MODEL_CANDIDATES[model_idx]
+    for model in OPENAI_MODEL_CANDIDATES:
         try:
             print(f"[LLM] Trying OpenAI model candidate: {model}")
             resp = openai_client.chat.completions.create(
@@ -939,82 +716,91 @@ def _llm_rank_openai(feed: List[dict], sys_prompt: str, user_msg: str, items: Li
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.1,
-                max_tokens=600,
+                max_tokens=LLM_MAX_OUTPUT_TOKENS,
             )
             txt = resp.choices[0].message.content.strip()
-            out = _parse_llm_response(txt, items)
-            print(f"[LLM] OpenAI model={model} produced {len(out)} ranking items")
-            return out, model
+            parsed = _parse_llm_response(txt, allowed_ids)
+            print(f"[LLM] OpenAI model={model} judged act={len(parsed.act)} know={len(parsed.know)}")
+            return parsed, model
         except Exception as e:
             last_err = e
             print(f"[LLM] OpenAI model={model} failed: {type(e).__name__}: {e}")
-            model_idx += 1
             time.sleep(backoff)
             backoff *= 2.0
 
-    print(f"[LLM] OpenAI total failure: {type(last_err).__name__ if last_err else 'UnknownError'}: {last_err}")
-    return [], OPENAI_MODEL_CANDIDATES[min(model_idx, len(OPENAI_MODEL_CANDIDATES)-1)]
+    raise LLMExhaustedError(f"OpenAI failed all candidates: {type(last_err).__name__}: {last_err}")
 
 
-def llm_rank(items: List[dict]) -> Tuple[List[dict], str]:
-    """Rank emails using configured LLM provider (Gemini or OpenAI)."""
+def llm_rank(items: List[dict], rubric: str) -> Tuple[ParsedJudgment, str]:
+    """Judge the whole pool in one request. Gemini first; a valid result (even
+    empty) is returned WITHOUT calling OpenAI. Gemini failure → OpenAI chain.
+    Both exhausted → LLMExhaustedError (→ error email + failed run)."""
     has_gemini_key = bool(os.getenv("GEMINI_API_KEY"))
     has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
-    print(
-        f"[LLM] provider={LLM_PROVIDER} gemini_key_present={has_gemini_key} "
-        f"openai_key_present={has_openai_key} gemini_model={GEMINI_MODEL}"
-    )
+    print(f"[LLM] provider={LLM_PROVIDER} gemini_key_present={has_gemini_key} "
+          f"openai_key_present={has_openai_key} gemini_model={GEMINI_MODEL}")
 
     if not items:
         default_model = GEMINI_MODEL if LLM_PROVIDER == "gemini" else OPENAI_MODEL_CANDIDATES[0]
-        return [], default_model
+        return ParsedJudgment([], [], 0), default_model
 
-    feed = [{
+    allowed_ids = {it["id"] for it in items}
+    payload = [{
         "id": it["id"],
+        "from_name": it["from_name"],
+        "from_address": it["from_address"],
         "subject": it["subject"],
-        "from_domain": it["from_domain"],
-        "snippet": it["snippet"],
-        "txn_alert": bool(it["txn_alert"]),
-        "txn_currency": it["txn_currency"],
-        "txn_amount": it["txn_amount"],
-        "txn_small": bool(it["txn_small"]),
-        "has_deadline_word": bool(it["has_deadline_word"]),
-        "billing_cue": bool(it.get("billing_cue")),
-        "is_social": bool(it.get("is_social")),
-        "is_reply": bool(it.get("is_reply")),
-        "booking_cue": bool(it.get("booking_cue")),
-        "reservation_ref": bool(it.get("reservation_ref")),
-        "is_adv": bool(it.get("is_adv")),
-        "promo_like": bool(it.get("promo_like")),
+        "body_for_llm": it["body_for_llm"],
     } for it in items]
 
-    user_msg = RANK_USER_TMPL + "\n\n" + json.dumps(feed, ensure_ascii=False)
-    sys_prompt = RANK_SYSTEM + "\n\nReturn ONLY a compact JSON array. Do not add commentary."
+    sys_prompt = SYSTEM_PROMPT.replace("{RUBRIC_MD}", rubric)
+    today = datetime.datetime.now(DISPLAY_TZ).strftime("%A, %Y-%m-%d")
+    user_msg = (
+        f"Today is {today} ({DISPLAY_TZ_NAME}).\n\n"
+        f"Candidate emails (JSON array):\n\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
 
-    # Try Gemini first if configured
-    if LLM_PROVIDER == "gemini":
-        if not gemini_client:
-            print("[Rank] GEMINI_API_KEY not set, falling back to OpenAI")
-        else:
-            print(f"[LLM] Using Gemini provider with model={GEMINI_MODEL}")
-            result, model = _llm_rank_gemini(feed, sys_prompt, user_msg, items)
-            if result:  # Gemini succeeded
-                return result, model
-            # Gemini failed, fall back to OpenAI
-            print("[Rank] Gemini failed, falling back to OpenAI")
+    errors: List[str] = []
 
-    # Use OpenAI (either as primary or fallback)
+    # Gemini first (if configured)
+    if LLM_PROVIDER == "gemini" and gemini_client:
+        try:
+            return _llm_rank_gemini(sys_prompt, user_msg, allowed_ids)
+        except LLMExhaustedError as e:
+            print(f"[Rank] Gemini exhausted, falling back to OpenAI: {e}")
+            errors.append(f"gemini: {e}")
+
+    # OpenAI (primary when configured that way, or fallback)
     if openai_client:
-        print("[LLM] Using OpenAI provider")
-        return _llm_rank_openai(feed, sys_prompt, user_msg, items)
+        try:
+            return _llm_rank_openai(sys_prompt, user_msg, allowed_ids)
+        except LLMExhaustedError as e:
+            errors.append(f"openai: {e}")
 
-    # No working provider
-    print("[LLM] ERROR: No LLM provider available (no API keys configured)")
-    return [], "none"
+    raise LLMExhaustedError(
+        "All LLM providers exhausted: " + " | ".join(errors)
+        if errors else "No LLM provider configured (no API keys)."
+    )
 
 # -----------------------------
-# Rendering — "old look"
+# Rendering — two tiers, "old look"
 # -----------------------------
+CATEGORY_BG = {
+    "Billing": "#bbf7d0",
+    "Government": "#fde68a",
+    "Transaction": "#bbf7d0",
+    "Travel": "#bfdbfe",
+    "Security": "#e9d5ff",
+    "Newsletter": "#e0e7ff",
+    "Account": "#fed7aa",
+    "Other": "#e5e7eb",
+    # legacy labels tolerated
+    "Legal": "#fecaca",
+}
+
+FOOTER_TEXT = "Reply 'noise: X' or 'missed: X' — I'll fold it into rubric.md."
+
 def _badge(label: str, bg: str, color: str = "#111"):
     return f"<span style='display:inline-block;padding:2px 8px;border-radius:12px;background:{bg};color:{color};font-size:12px;font-weight:600'>{html.escape(label)}</span>"
 
@@ -1022,140 +808,94 @@ def _titlecase_or(raw: Optional[str], fallback: str) -> str:
     s = (raw or "").strip()
     return s[:1].upper() + s[1:] if s else fallback
 
-def _display_why(row: dict, item: dict) -> str:
-    why = _as_text((row or {}).get("why")).strip()
-    if why:
-        return why
+def _digest_ids_marker(selected: List[dict]) -> str:
+    ids = [r["id"] for r in selected]
+    return ",".join(ids) if ids else "none"
 
-    it = item or {}
-    if it.get("has_deadline_word") or it.get("billing_cue"):
-        return "Contains billing/deadline cues that may require action."
-    if it.get("txn_alert") and not it.get("txn_small"):
-        return "Transaction alert above threshold; review for unexpected charges."
-    if it.get("txn_alert"):
-        return "Transaction alert detected; included for monitoring."
-    if it.get("is_reply") or it.get("booking_cue") or it.get("reservation_ref"):
-        return "Reply or booking context suggests a likely follow-up action."
-    if it.get("is_social"):
-        return "Social/account notification; generally lower urgency."
-    if it.get("is_adv") or it.get("promo_like"):
-        return "Promotional content ranked lower than action-oriented emails."
-    return "Ranked as one of the most relevant messages in the selected window."
+def _section_plain(title: str, rows: List[dict], by_id: dict) -> List[str]:
+    lines = [f"## {title} ({len(rows)})"]
+    if not rows:
+        lines.append("_None._")
+        lines.append("")
+        return lines
+    for i, row in enumerate(rows, 1):
+        it = by_id.get(row["id"], {})
+        subj = it.get("subject", "(no subject)")
+        frm = it.get("from_raw") or it.get("from_name") or it.get("from_address")
+        cat = row.get("category") or "Other"
+        why = row.get("reason", "")
+        act = row.get("action", "")
+        amt = row.get("amount", "")
+        prev = (it.get("body_preview") or "").strip()
+        lines.append(f"{i}. {subj} — {frm}")
+        lines.append(f"   - Category: {cat}" + (f" | Txn: {amt}" if amt else ""))
+        if why:
+            lines.append(f"   - Why: {why}")
+        if act:
+            lines.append(f"   - Action: {act}")
+        if prev:
+            lines.append(f"   - Preview: {prev}")
+        lines.append("")
+    return lines
 
-def render_digest(items: List[dict], top: List[dict], window_start: int, window_end: int, considered_count: int, used_model: str) -> Tuple[str,str]:
-    ws = datetime.datetime.fromtimestamp(window_start, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
-    we = datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+def _card_html(i: int, row: dict, it: dict) -> str:
+    subj = html.escape(it.get("subject", "(no subject)"))
+    frm = html.escape(it.get("from_raw") or it.get("from_name") or it.get("from_address") or "")
+    dom = html.escape(it.get("from_domain", "") or "")
+    domain_link = f"<a href='https://{dom}' style='color:#2563eb;text-decoration:none'>{dom}</a>" if dom else ""
+    prev = html.escape((it.get("body_preview") or "").strip())
+    why = html.escape(row.get("reason", ""))
+    act = html.escape(row.get("action", ""))
+    cat = _titlecase_or(row.get("category"), "Other")
+    cat_bg = CATEGORY_BG.get(cat, "#e5e7eb")
 
-    by_id = {it["id"]: it for it in items}
+    txn_chip = ""
+    amt = row.get("amount", "")
+    if amt:
+        txn_chip = _badge(f"Txn {amt}", "#bbf7d0")
 
-    # Plain text
-    plain_lines = [
-        f"# AI Email Digest ({datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})",
-        f"Model: {used_model}",
-        f"Considered: {considered_count} emails · Window: {ws} → {we}",
-        "",
-        f"# Today's Top {len(top)} Emails",
-    ]
-    if not top:
-        plain_lines.append("_No eligible emails._")
-    else:
-        for i, row in enumerate(top, 1):
-            it = by_id.get(row["id"], {})
-            subj = it.get("subject", "(no subject)")
-            frm = it.get("from_raw") or it.get("from_friendly") or it.get("from_domain")
-            why = _display_why(row, it)
-            act = _as_text(row.get("action"))
-            urg = _as_text(row.get("urgency")) or "Low"
-            cat = _as_text(row.get("category")) or "Other"
-            snip = (it.get("snippet") or "").strip()
-            plain_lines.append(f"{i}. {subj} — {frm}")
-            plain_lines.append(f"   - Category: {cat} | Urgency: {urg}")
-            if why: plain_lines.append(f"   - Why: {why}")
-            if act: plain_lines.append(f"   - Action: {act}")
-            if snip: plain_lines.append(f"   - Snippet: {snip}")
-            plain_lines.append("")
-    # Appendix (plain)
-    plain_lines.append(f"\n---\n## Appendix — All considered ({len(items)})")
+    return f"""
+      <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:10px 0;background:#ffffff">
+        <div style="font-weight:700;font-size:15px;line-height:1.3;margin-bottom:4px">{i}. {subj}</div>
+        <div style="color:#6b7280;font-size:13px;margin-bottom:4px">{domain_link}</div>
+        <div style="color:#6b7280;font-size:13px;margin-bottom:8px">{frm}</div>
+        <div style="margin-bottom:8px">
+          {_badge(cat, cat_bg)}
+          {'<span style="display:inline-block;width:6px"></span>' + txn_chip if txn_chip else ''}
+        </div>
+        {('<div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> ' + why + '</div>') if why else ''}
+        {('<div style="font-size:13px;margin-bottom:6px"><strong>Action:</strong> ' + act + '</div>') if act else ''}
+        {('<div style="font-size:12px;color:#6b7280"><strong>Preview:</strong> ' + prev + '</div>') if prev else ''}
+      </div>
+    """
+
+def _section_html(title: str, rows: List[dict], by_id: dict) -> str:
+    head = f"<h3 style='margin:16px 0 6px 0;font-size:15px'>{html.escape(title)} ({len(rows)})</h3>"
+    if not rows:
+        return head + "<p style='color:#6b7280;font-size:13px;margin:0 0 8px 0'><em>None.</em></p>"
+    cards = "".join(_card_html(i, row, by_id.get(row["id"], {})) for i, row in enumerate(rows, 1))
+    return head + cards
+
+def _appendix_plain(items: List[dict]) -> List[str]:
+    lines = [f"\n---\n## Appendix — All considered ({len(items)})"]
     for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
-        plain_lines.append(f"- [{sg_time(it['timestamp'])}] {it.get('from_raw','?')} — {it.get('subject','(no subject)')}")
-    plain_txt = "\n".join(plain_lines)
+        lines.append(f"- [{sg_time(it['timestamp'])}] {it.get('from_raw','?')} — {it.get('subject','(no subject)')}")
+    return lines
 
-    # HTML
-    title = f"AI Email Digest ({datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})"
-    header_html = (
-        f"<h2 style='margin:0 0 4px 0;font-size:20px'>{html.escape(title)}</h2>"
-        f"<div style='color:#6b7280;font-size:12px;margin-bottom:12px'>"
-        f"Model: <strong>{html.escape(used_model)}</strong> · "
-        f"Considered: <strong>{considered_count}</strong> emails · "
-        f"Window: {html.escape(ws)} → {html.escape(we)}</div>"
-    )
-
-    items_html = []
-    if not top:
-        items_html.append("<p><em>No eligible emails.</em></p>")
-    else:
-        for i, row in enumerate(top, 1):
-            it = by_id.get(row["id"], {})
-            subj = html.escape(it.get("subject", "(no subject)"))
-            frm = html.escape(it.get("from_raw") or it.get("from_friendly") or it.get("from_domain") or "")
-            dom = html.escape(it.get("from_domain", "") or "")
-            domain_link = f"<a href='https://{dom}' style='color:#2563eb;text-decoration:none'>{dom}</a>" if dom else ""
-            snip = html.escape((it.get("snippet") or "").strip())
-            why = html.escape(_display_why(row, it))
-            act = html.escape(_as_text(row.get("action")))
-            # Normalize badge labels closer to old look
-            cat = _titlecase_or(_as_text(row.get("category")), "Other")
-            urg = _titlecase_or(_as_text(row.get("urgency")), "Low")
-            typ = _titlecase_or(_as_text(row.get("type")), "For Information Only")
-            # badge colors (soft)
-            type_bg = "#dbeafe" if typ == "For Information Only" else "#fde68a"
-            cat_bg_map = {"Legal": "#fecaca", "Government": "#fde68a", "Billing" : "#bbf7d0", "Billing/payment": "#bbf7d0", "Other": "#e5e7eb", "Transaction": "#bbf7d0", "Security": "#e9d5ff"}
-            cat_bg = cat_bg_map.get(cat, "#e5e7eb")
-            urg_bg_map = {"High": "#fecaca", "Medium": "#fde68a", "Low": "#d1fae5"}
-            urg_bg = urg_bg_map.get(urg, "#e5e7eb")
-
-            txn_chip = ""
-            if it.get("txn_alert"):
-                amt = it.get("txn_amount")
-                cur = it.get("txn_currency") or "SGD"
-                if isinstance(amt, (int, float)):
-                    big = amt >= TXN_HIGH_ALERT_MIN
-                    txn_chip = _badge(f"Txn {cur} {amt:.2f}", "#bbf7d0" if big else "#e5e7eb")
-                else:
-                    txn_chip = _badge("Txn alert", "#e5e7eb")
-
-            items_html.append(f"""
-              <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin:10px 0;background:#ffffff">
-                <div style="font-weight:700;font-size:15px;line-height:1.3;margin-bottom:4px">{i}. {subj}</div>
-                <div style="color:#6b7280;font-size:13px;margin-bottom:4px">{domain_link}</div>
-                <div style="color:#6b7280;font-size:13px;margin-bottom:8px">{frm}</div>
-                <div style="margin-bottom:8px">
-                  {_badge(typ, type_bg)}
-                  <span style="display:inline-block;width:6px"></span>
-                  {_badge(cat, cat_bg)}
-                  <span style="display:inline-block;width:6px"></span>
-                  {_badge(f"Urgency: {urg}", urg_bg)}
-                  {'<span style="display:inline-block;width:6px"></span>' + txn_chip if txn_chip else ''}
-                </div>
-                {('<div style="font-size:13px;margin-bottom:6px"><strong>Why:</strong> ' + why + '</div>') if why else ''}
-                {('<div style="font-size:13px;margin-bottom:6px"><strong>Action:</strong> ' + act + '</div>') if act else ''}
-                {('<div style="font-size:12px;color:#6b7280"><strong>Snippet:</strong> ' + snip + '</div>') if snip else ''}
-              </div>
-            """)
-
-    appendix_rows = []
+def _appendix_html(items: List[dict]) -> str:
+    rows = []
     for it in sorted(items, key=lambda x: x["timestamp"], reverse=True):
         t = html.escape(sg_time(it["timestamp"]))
-        f = html.escape(it.get("from_raw") or it.get("from_friendly") or "?")
+        f = html.escape(it.get("from_raw") or it.get("from_name") or "?")
         s = html.escape(it.get("subject") or "(no subject)")
-        appendix_rows.append(
+        rows.append(
             "<tr>"
             f"<td style='padding:6px 8px;color:#6b7280;font-size:12px;border-bottom:1px solid #f0f0f0'>{t}</td>"
             f"<td style='padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0'>{f}</td>"
             f"<td style='padding:6px 8px;font-size:12px;border-bottom:1px solid #f0f0f0'>{s}</td>"
             "</tr>"
         )
-    appendix_html = (
+    return (
         "<div style='margin-top:14px'>"
         f"<h3 style='margin:0 0 6px 0;font-size:14px'>Appendix — All considered ({len(items)})</h3>"
         "<table style='border-collapse:collapse;width:100%;margin-top:8px'>"
@@ -1164,16 +904,81 @@ def render_digest(items: List[dict], top: List[dict], window_start: int, window_
         "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>From</th>"
         "<th style='text-align:left;padding:6px 8px;font-size:12px;color:#374151'>Subject</th>"
         "</tr></thead><tbody>"
-        + "".join(appendix_rows) +
+        + "".join(rows) +
         "</tbody></table></div>"
+    )
+
+def render_digest(items: List[dict], selected: List[dict], omitted_act_count: int,
+                  window_start: int, window_end: int, considered_count: int,
+                  used_model: str) -> Tuple[str, str]:
+    ws = datetime.datetime.fromtimestamp(window_start, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    we = datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    date_str = datetime.datetime.fromtimestamp(window_end, tz=DISPLAY_TZ).strftime("%Y-%m-%d")
+
+    by_id = {it["id"]: it for it in items}
+    act_rows = [r for r in selected if r.get("tier") == "ACT"]
+    know_rows = [r for r in selected if r.get("tier") == "KNOW"]
+    marker = _digest_ids_marker(selected)
+
+    # ---- Plain text ----
+    plain_lines = [
+        f"# AI Email Digest ({date_str})",
+        f"Model: {used_model}",
+        f"Considered: {considered_count} emails · Window: {ws} → {we}",
+        "",
+    ]
+    if not selected:
+        plain_lines.append(f"Nothing needs you today — considered {considered_count} emails.")
+        plain_lines.append("")
+    else:
+        plain_lines += _section_plain("Action needed", act_rows, by_id)
+        if omitted_act_count > 0:
+            plain_lines.append(f"+{omitted_act_count} more action items today — see appendix.")
+            plain_lines.append("")
+        plain_lines += _section_plain("Worth knowing", know_rows, by_id)
+
+    plain_lines += _appendix_plain(items)
+    plain_lines.append("")
+    plain_lines.append(FOOTER_TEXT)
+    plain_lines.append(f"[digest-ids] {marker}")   # MUST remain the last line
+    plain_txt = "\n".join(plain_lines)
+
+    # ---- HTML ----
+    title = f"AI Email Digest ({date_str})"
+    header_html = (
+        f"<h2 style='margin:0 0 4px 0;font-size:20px'>{html.escape(title)}</h2>"
+        f"<div style='color:#6b7280;font-size:12px;margin-bottom:12px'>"
+        f"Model: <strong>{html.escape(used_model)}</strong> · "
+        f"Considered: <strong>{considered_count}</strong> emails · "
+        f"Window: {html.escape(ws)} → {html.escape(we)}</div>"
+    )
+
+    if not selected:
+        body_html = (
+            f"<p style='font-size:15px;margin:8px 0 4px 0'>Nothing needs you today — "
+            f"considered <strong>{considered_count}</strong> emails.</p>"
+        )
+    else:
+        body_html = _section_html("Action needed", act_rows, by_id)
+        if omitted_act_count > 0:
+            body_html += (
+                f"<p style='font-size:13px;color:#6b7280;margin:6px 0'>"
+                f"+{omitted_act_count} more action items today — see appendix.</p>"
+            )
+        body_html += _section_html("Worth knowing", know_rows, by_id)
+
+    footer_html = (
+        f"<div style='color:#6b7280;font-size:12px;margin-top:12px'>{html.escape(FOOTER_TEXT)}</div>"
+        f"<div style='color:#9ca3af;font-size:11px;margin-top:4px'>— Generated by your Email Digest Assistant</div>"
     )
 
     html_body = (
         "<html><body>"
         "<div style='font-family:Inter,Segoe UI,Arial,sans-serif;max-width:720px;margin:0 auto;padding:16px 12px;background:#f8fafc'>"
-        + header_html + "".join(items_html) + appendix_html +
-        "<div style='color:#9ca3af;font-size:11px;margin-top:12px'>— Generated by your Email Digest Assistant</div>"
-        "</div></body></html>"
+        + header_html + body_html + _appendix_html(items) + footer_html +
+        "</div>"
+        f"<!-- digest-ids: {marker} -->"
+        "</body></html>"
     )
 
     return plain_txt, html_body
@@ -1278,6 +1083,95 @@ def _write_last_sent_timestamp(ts: int):
         f.write(str(ts))
 
 # -----------------------------
+# Cross-digest dedup (marker read-back from Sent)
+# -----------------------------
+DIGEST_IDS_PLAIN_RE = re.compile(r'\[digest-ids\]\s*([A-Za-z0-9,]+|none)', re.I)
+DIGEST_IDS_HTML_RE = re.compile(r'digest-ids:\s*([A-Za-z0-9,]+|none)', re.I)
+
+def _extract_raw_text_parts(msg) -> Tuple[str, str]:
+    """Return (plain_concat, html_concat) decoded but WITHOUT html-to-text
+    stripping — so the HTML comment marker survives for fallback parsing."""
+    plain: List[str] = []
+    html_parts: List[str] = []
+
+    def decode(d: Optional[str]) -> str:
+        if not d:
+            return ""
+        try:
+            return base64.urlsafe_b64decode(d.encode("UTF-8")).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def walk(p):
+        mt = p.get("mimeType", "")
+        body = p.get("body", {}) or {}
+        if mt == "text/plain":
+            plain.append(decode(body.get("data")))
+        elif mt == "text/html":
+            html_parts.append(decode(body.get("data")))
+        for sp in (p.get("parts") or []):
+            walk(sp)
+
+    walk(msg.get("payload", {}) or {})
+    return "\n".join(plain), "\n".join(html_parts)
+
+def _extract_digest_ids_from_message(msg) -> Optional[set]:
+    """Recover the [digest-ids] set from a sent digest. Plain-text marker is
+    primary; HTML comment is fallback. Returns None if unparseable (fail-open)."""
+    plain, html_raw = _extract_raw_text_parts(msg)
+    m = (
+        DIGEST_IDS_PLAIN_RE.search(plain)
+        or DIGEST_IDS_PLAIN_RE.search(html_raw)
+        or DIGEST_IDS_HTML_RE.search(html_raw)
+        or DIGEST_IDS_HTML_RE.search(plain)
+    )
+    if not m:
+        return None
+    val = m.group(1).strip().lower()
+    if val == "none":
+        return set()
+    return {x for x in val.split(",") if x}
+
+def _load_suppressed_ids(service, n: int = 3) -> set:
+    """Fetch the last n Sent digests (format=full) and union their marker IDs.
+    Any failure or unparseable digest fails open (contributes nothing)."""
+    suppressed: set = set()
+    user_id = "me"
+    query = 'in:sent subject:"AI Email Digest ("'
+    try:
+        resp = _with_retries(
+            lambda: service.users().messages().list(
+                userId=user_id, q=query, maxResults=n, includeSpamTrash=False,
+            ).execute(),
+            what="messages.list[dedup-sent]"
+        )
+        msgs = resp.get("messages", []) or []
+    except Exception as e:
+        debug_print(f"[Dedup] Sent list failed, fail-open: {e}")
+        return suppressed
+
+    for m in msgs:
+        mid = m["id"]
+        try:
+            full = _with_retries(
+                lambda mid=mid: service.users().messages().get(
+                    userId=user_id, id=mid, format="full",
+                ).execute(),
+                what=f"messages.get[dedup:{mid}]"
+            )
+        except Exception as e:
+            print(f"[Dedup] fetch failed for sent digest id={mid}; fail-open: {e}")
+            continue
+        ids = _extract_digest_ids_from_message(full)
+        if ids is None:
+            print(f"[Dedup] unparseable marker in sent digest id={mid}; fail-open, contributes nothing")
+            continue
+        suppressed |= ids
+
+    debug_print(f"[Dedup] suppressed_ids={len(suppressed)} (from {len(msgs)} sent digests)")
+    return suppressed
+
+# -----------------------------
 # Main
 # -----------------------------
 def main():
@@ -1286,6 +1180,9 @@ def main():
         return
 
     try:
+        # Rubric is a hard precondition for any run (incl. empty/heartbeat days).
+        rubric = load_rubric()
+
         service = _gmail_service()
 
         now = int(time.time())
@@ -1299,15 +1196,35 @@ def main():
         print("UTC now:", datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%d %H:%M"))
         print(f"Window (display {DISPLAY_TZ_NAME}): {sg_time(since_unix)} → {sg_time(now)}")
 
-        items = fetch_all_since_v2(service, since_unix, snippet_len=SNIPPET_LEN)
+        items = fetch_all_since_v2(service, since_unix)
         considered_count = len(items)
 
-        top, used_model = llm_rank(items)
-        provider_used = "gemini" if used_model.startswith("gemini") else ("openai" if used_model.startswith("gpt-") else "none")
-        print(f"[LLM] Summary: provider_used={provider_used} model_used={used_model} top_items={len(top)}")
+        suppressed_ids = _load_suppressed_ids(service)
 
-        plain, html_body = render_digest(items, top, since_unix, now, considered_count, used_model)
+        parsed, used_model = llm_rank(items, rubric)
+        selected, omitted_act_count = select_top(parsed, suppressed_ids, DEDUP_SUPPRESS_ACT)
+
+        provider_used = "gemini" if used_model.startswith("gemini") else ("openai" if used_model.startswith("gpt-") else "none")
+        print(f"[LLM] Summary: provider_used={provider_used} model_used={used_model} "
+              f"act={sum(1 for r in selected if r['tier']=='ACT')} "
+              f"know={sum(1 for r in selected if r['tier']=='KNOW')} "
+              f"omitted_act={omitted_act_count} suppressed={len(suppressed_ids)}")
+
+        plain, html_body = render_digest(
+            items, selected, omitted_act_count, since_unix, now, considered_count, used_model
+        )
         subject = f"AI Email Digest ({datetime.datetime.fromtimestamp(now, tz=DISPLAY_TZ).strftime('%Y-%m-%d')})"
+
+        if DRY_RUN:
+            print("=== DRY_RUN: rendered digest (plain text) ===")
+            print(plain)
+            print("=== DRY_RUN: decisions ===")
+            for r in selected:
+                print(json.dumps(r, ensure_ascii=False))
+            print(f"=== DRY_RUN: omitted_act_count={omitted_act_count} "
+                  f"suppressed_ids={len(suppressed_ids)} subject={subject!r} ===")
+            print("DRY_RUN=1; skipping SMTP send and watermark write.")
+            return
 
         send_digest_email(subject, plain, html_body)
         print("Digest sent.")
